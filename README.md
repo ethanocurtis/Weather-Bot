@@ -2,7 +2,7 @@
 
 This is a minimal, production-ready Discord bot that runs in Docker and provides weather commands, daily/weekly DM subscriptions, and NWS alert DMs.
 
-It **reuses your existing `weather.py` cog** and wires in a tiny SQLite-backed store so it works standalone.
+It uses `weather.py` cog** and wires in a tiny SQLite-backed store so it works standalone.
 
 ---
 
