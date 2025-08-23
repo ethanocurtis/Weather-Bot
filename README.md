@@ -53,7 +53,7 @@ wxbot/
 ├─ docker-compose.yml
 ├─ requirements.txt
 ├─ main.py             # bot entrypoint (loads weather cog and syncs commands)
-├─ weather.py          # your weather cog (unchanged)
+├─ weather.py          # weather cog
 ├─ weather_store.py    # tiny SQLite store
 ├─ .env.example
 └─ data/               # persisted by docker-compose (created at runtime)
