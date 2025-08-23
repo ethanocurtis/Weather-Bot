@@ -1,0 +1,9 @@
+version: "3.8"
+services:
+  wxbot:
+    build: .
+    container_name: wxbot
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
