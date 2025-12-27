@@ -77,3 +77,22 @@ python main.py
 - **Commands not appearing**: global slash commands can take some time to show up the first time after sync. You can also invite the bot to a test guild and use a guild-specific sync if you prefer.
 - **Time zone**: The cog schedules in America/Chicago. That is intentional to mirror original behavior.
 - **Persistence**: Ensure the `./data` folder is writable on the host.
+
+
+---
+
+## Feedback / Feature Requests
+
+This bot is DM-first, so the safest way to collect user feedback is via slash commands.
+
+1. Set your owner user ID in `.env` as `BOT_OWNER_ID` **or** set `FEEDBACK_CHANNEL_ID` to a private channel in your own server.
+2. Users can then run:
+   - `/feedback <message>`
+   - `/bug <message>`
+   - `/feature <message>`
+
+The bot will forward the message (with user + server context) to your configured destination.
+
+Notes:
+- There is a basic 60-second per-user cooldown to prevent spam.
+- If you set both `FEEDBACK_CHANNEL_ID` and `BOT_OWNER_ID`, the channel is used.
