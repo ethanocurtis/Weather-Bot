@@ -17,6 +17,19 @@ log = logging.getLogger("wxbot")
 intents = discord.Intents.default()  # no message content needed for slash commands
 
 
+class WxBot(commands.Bot):
+    async def setup_hook(self) -> None:
+        # Load extensions here (runs at the right time for app commands)
+        await self.load_extension("weather")
+
+        # Sync app commands after login/application_id is available
+        try:
+            synced = await self.tree.sync()
+            log.info("Synced %d app commands globally.", len(synced))
+        except Exception:
+            log.exception("Failed to sync app commands.")
+
+
 async def main():
     if not TOKEN:
         raise SystemExit("Missing DISCORD_TOKEN in environment.")
@@ -28,7 +41,7 @@ async def main():
         except ValueError:
             log.warning("DISCORD_APP_ID is set but not an int; ignoring.")
 
-    bot = commands.Bot(command_prefix="!", **bot_kwargs)
+    bot = WxBot(command_prefix="!", **bot_kwargs)
 
     # Attach store to bot so cogs can use it
     bot.store = WxStore(os.getenv("WXBOT_DB_PATH", "data/wxbot.sqlite3"))
@@ -37,16 +50,7 @@ async def main():
     async def on_ready():
         log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
-    async def load_ext():
-        await bot.load_extension("weather")
-        try:
-            synced = await bot.tree.sync()
-            log.info("Synced %d app commands globally.", len(synced))
-        except Exception:
-            log.exception("Failed to sync app commands.")
-
     async with bot:
-        await load_ext()
         await bot.start(TOKEN)
 
 
