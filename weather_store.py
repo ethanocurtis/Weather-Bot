@@ -88,25 +88,42 @@ class WxStore:
         self.db.commit()
         return int(cur.lastrowid)
 
-    def list_weather_subs(self, user_id: int) -> List[Dict[str, Any]]:
+    def list_weather_subs(self, user_id: Optional[int]) -> List[Dict[str, Any]]:
+    """List subscriptions. If user_id is None, returns all subs."""
+    if user_id is None:
         rows = self.db.execute(
             """
             SELECT id, user_id, zip, cadence, hh, mi, weekly_days, next_run_utc
             FROM weather_subs
-            WHERE user_id = ?
             ORDER BY next_run_utc ASC
-            """,
-            (int(user_id),),
+            """
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def remove_weather_sub(self, user_id: int, sub_id: int) -> int:
-        cur = self.db.cursor()
-        cur.execute("DELETE FROM weather_subs WHERE user_id = ? AND id = ?", (int(user_id), int(sub_id)))
-        self.db.commit()
-        return int(cur.rowcount)
+    rows = self.db.execute(
+        """
+        SELECT id, user_id, zip, cadence, hh, mi, weekly_days, next_run_utc
+        FROM weather_subs
+        WHERE user_id = ?
+        ORDER BY next_run_utc ASC
+        """,
+        (int(user_id),),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
-    def update_weather_sub(self, sub_id: int, next_run_utc: str) -> None:
+
+    def remove_weather_sub(self, sub_id: int, requester_id: int) -> bool:
+    """Remove a subscription by ID, only if it belongs to requester_id."""
+    cur = self.db.cursor()
+    cur.execute(
+        "DELETE FROM weather_subs WHERE id = ? AND user_id = ?",
+        (int(sub_id), int(requester_id)),
+    )
+    self.db.commit()
+    return cur.rowcount > 0
+
+
+    def update_weather_sub(self, sub_id: int, next_run_utc: str, **_ignored) -> None:
         self.db.execute("UPDATE weather_subs SET next_run_utc = ? WHERE id = ?", (str(next_run_utc), int(sub_id)))
         self.db.commit()
 

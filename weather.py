@@ -220,52 +220,111 @@ class Weather(commands.Cog):
 
     # -------- Slash Commands --------
 
-async def _send_feedback(self, inter: discord.Interaction, kind: str, message: str) -> None:
-    # simple cooldown: 1 per 60s per user
-    now = asyncio.get_event_loop().time()
-    last = self._feedback_last.get(inter.user.id, 0.0)
-    if now - last < 60:
-        raise RuntimeError("cooldown")
-    self._feedback_last[inter.user.id] = now
 
-    message = message.strip()
-    if not message:
-        raise ValueError("empty")
-    if len(message) > 1800:
-        message = message[:1800] + "…"
+    async def _send_feedback(self, inter: discord.Interaction, kind: str, message: str) -> None:
+        # simple cooldown: 1 per 60s per user
+        now = asyncio.get_event_loop().time()
+        last = self._feedback_last.get(inter.user.id, 0.0)
+        if now - last < 60:
+            raise RuntimeError("cooldown")
+        self._feedback_last[inter.user.id] = now
 
-    where = "DM" if inter.guild is None else f"{inter.guild.name} ({inter.guild.id})"
+        message = (message or "").strip()
+        if not message:
+            raise ValueError("empty")
+        if len(message) > 1800:
+            message = message[:1800] + "…"
 
-    embed = discord.Embed(
-        title=f"Weather Bot {kind}",
-        description=message,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.add_field(name="From", value=f"{inter.user} ({inter.user.id})", inline=False)
-    embed.add_field(name="Context", value=where, inline=False)
+        where = "DM" if inter.guild is None else f"{inter.guild.name} ({inter.guild.id})"
 
-    # Prefer a feedback channel; fallback to DMing the owner
-    if FEEDBACK_CHANNEL_ID:
-        ch = self.bot.get_channel(FEEDBACK_CHANNEL_ID)
-        if ch is None:
-            try:
-                ch = await self.bot.fetch_channel(FEEDBACK_CHANNEL_ID)
-            except Exception:
-                ch = None
-        if ch is None:
-            raise RuntimeError("bad_channel")
-        await ch.send(embed=embed)
-        return
+        embed = discord.Embed(
+            title=f"Weather Bot {kind}",
+            description=message,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="From", value=f"{inter.user} ({inter.user.id})", inline=False)
+        embed.add_field(name="Context", value=where, inline=False)
 
-    if not BOT_OWNER_ID:
-        raise RuntimeError("no_owner")
-    owner = self.bot.get_user(BOT_OWNER_ID)
-    if owner is None:
-        owner = await self.bot.fetch_user(BOT_OWNER_ID)
-    await owner.send(embed=embed)
+        # Prefer a feedback channel; fallback to DMing the owner
+        if FEEDBACK_CHANNEL_ID:
+            ch = self.bot.get_channel(FEEDBACK_CHANNEL_ID)
+            if ch is None:
+                try:
+                    ch = await self.bot.fetch_channel(FEEDBACK_CHANNEL_ID)
+                except Exception:
+                    ch = None
+            if ch is None:
+                raise RuntimeError("bad_channel")
+            await ch.send(embed=embed)
+            return
 
+        if not BOT_OWNER_ID:
+            raise RuntimeError("no_owner")
 
-    @app_commands.command(name="weather", description="Current weather by ZIP. Uses your saved ZIP if omitted.")
+        owner = self.bot.get_user(BOT_OWNER_ID)
+        if owner is None:
+            owner = await self.bot.fetch_user(BOT_OWNER_ID)
+        await owner.send(embed=embed)
+
+    @app_commands.command(name="feedback", description="Send feedback to the bot owner.")
+    @app_commands.describe(message="What should I improve? Bug report or feature request.")
+    async def feedback_cmd(self, inter: discord.Interaction, message: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+        try:
+            await self._send_feedback(inter, "Feedback", message)
+        except RuntimeError as e:
+            if str(e) == "cooldown":
+                return await inter.followup.send("You're sending feedback a bit fast—try again in a minute.", ephemeral=True)
+            if str(e) == "no_owner":
+                return await inter.followup.send("Feedback isn't configured (missing BOT_OWNER_ID).", ephemeral=True)
+            if str(e) == "bad_channel":
+                return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
+            return await inter.followup.send("Couldn't deliver your feedback (DMs may be blocked).", ephemeral=True)
+        except ValueError:
+            return await inter.followup.send("Please include a message.", ephemeral=True)
+
+        await inter.followup.send("✅ Thanks! Your feedback was sent.", ephemeral=True)
+
+    @app_commands.command(name="bug", description="Report a bug to the bot owner.")
+    @app_commands.describe(message="What happened? Include steps if possible.")
+    async def bug_cmd(self, inter: discord.Interaction, message: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+        try:
+            await self._send_feedback(inter, "Bug Report", message)
+        except RuntimeError as e:
+            if str(e) == "cooldown":
+                return await inter.followup.send("You're sending reports a bit fast—try again in a minute.", ephemeral=True)
+            if str(e) == "no_owner":
+                return await inter.followup.send("Bug reporting isn't configured (missing BOT_OWNER_ID).", ephemeral=True)
+            if str(e) == "bad_channel":
+                return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
+            return await inter.followup.send("Couldn't deliver your report (DMs may be blocked).", ephemeral=True)
+        except ValueError:
+            return await inter.followup.send("Please include a message.", ephemeral=True)
+
+        await inter.followup.send("✅ Thanks! Your bug report was sent.", ephemeral=True)
+
+    @app_commands.command(name="feature", description="Request a feature to the bot owner.")
+    @app_commands.describe(message="What would you like added/changed?")
+    async def feature_cmd(self, inter: discord.Interaction, message: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+        try:
+            await self._send_feedback(inter, "Feature Request", message)
+        except RuntimeError as e:
+            if str(e) == "cooldown":
+                return await inter.followup.send("You're sending requests a bit fast—try again in a minute.", ephemeral=True)
+            if str(e) == "no_owner":
+                return await inter.followup.send("Feature requests aren't configured (missing BOT_OWNER_ID).", ephemeral=True)
+            if str(e) == "bad_channel":
+                return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
+            return await inter.followup.send("Couldn't deliver your request (DMs may be blocked).", ephemeral=True)
+        except ValueError:
+            return await inter.followup.send("Please include a message.", ephemeral=True)
+
+        await inter.followup.send("✅ Thanks! Your feature request was sent.", ephemeral=True)
+
+    @app_commands.command(name="weather"
+, description="Current weather by ZIP. Uses your saved ZIP if omitted.")
     @app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
     async def weather_cmd(self, inter: discord.Interaction, zip: Optional[str] = None):
         if self.store is None:
@@ -680,63 +739,4 @@ async def setup(bot: commands.Bot):
     store = getattr(bot, "store", None)
     await bot.add_cog(Weather(bot, store=store))
 
-
-@app_commands.command(name="feedback", description="Send feedback to the bot owner (DM-only bot).")
-@app_commands.describe(message="What should I improve? Bug report or feature request.")
-async def feedback(self, inter: discord.Interaction, message: str):
-    await inter.response.defer(ephemeral=True, thinking=False)
-    try:
-        await self._send_feedback(inter, "Feedback", message)
-    except RuntimeError as e:
-        if str(e) == "cooldown":
-            return await inter.followup.send("You're sending feedback a bit fast—try again in a minute.", ephemeral=True)
-        if str(e) == "no_owner":
-            return await inter.followup.send("Feedback isn't configured (missing BOT_OWNER_ID).", ephemeral=True)
-        if str(e) == "bad_channel":
-            return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
-        return await inter.followup.send("Couldn't deliver your feedback (DMs may be blocked).", ephemeral=True)
-    except ValueError:
-        return await inter.followup.send("Please include a message.", ephemeral=True)
-
-    await inter.followup.send("✅ Thanks! Your feedback was sent.", ephemeral=True)
-
-
-@app_commands.command(name="bug", description="Report a bug to the bot owner.")
-@app_commands.describe(message="What happened? Include steps/screenshots if possible.")
-async def bug(self, inter: discord.Interaction, message: str):
-    await inter.response.defer(ephemeral=True, thinking=False)
-    try:
-        await self._send_feedback(inter, "Bug Report", message)
-    except RuntimeError as e:
-        if str(e) == "cooldown":
-            return await inter.followup.send("You're sending reports a bit fast—try again in a minute.", ephemeral=True)
-        if str(e) == "no_owner":
-            return await inter.followup.send("Bug reporting isn't configured (missing BOT_OWNER_ID).", ephemeral=True)
-        if str(e) == "bad_channel":
-            return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
-        return await inter.followup.send("Couldn't deliver your report (DMs may be blocked).", ephemeral=True)
-    except ValueError:
-        return await inter.followup.send("Please include a message.", ephemeral=True)
-
-    await inter.followup.send("✅ Thanks! Your bug report was sent.", ephemeral=True)
-
-
-@app_commands.command(name="feature", description="Request a feature to the bot owner.")
-@app_commands.describe(message="What would you like added/changed?")
-async def feature(self, inter: discord.Interaction, message: str):
-    await inter.response.defer(ephemeral=True, thinking=False)
-    try:
-        await self._send_feedback(inter, "Feature Request", message)
-    except RuntimeError as e:
-        if str(e) == "cooldown":
-            return await inter.followup.send("You're sending requests a bit fast—try again in a minute.", ephemeral=True)
-        if str(e) == "no_owner":
-            return await inter.followup.send("Feature requests aren't configured (missing BOT_OWNER_ID).", ephemeral=True)
-        if str(e) == "bad_channel":
-            return await inter.followup.send("Feedback channel is misconfigured (FEEDBACK_CHANNEL_ID).", ephemeral=True)
-        return await inter.followup.send("Couldn't deliver your request (DMs may be blocked).", ephemeral=True)
-    except ValueError:
-        return await inter.followup.send("Please include a message.", ephemeral=True)
-
-    await inter.followup.send("✅ Thanks! Your feature request was sent.", ephemeral=True)
 
