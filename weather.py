@@ -715,8 +715,43 @@ class Weather(commands.Cog):
                     parts.append(f"📏 {float(prec):.2f} {punit}")
                 lines.append(f"**{label}** — {icon} {desc} — " + " • ".join(parts))
 
-            # Keep embed size reasonable
-            emb.add_field(name="Forecast", value="\n".join(lines[:24]) or "No data.", inline=False)
+            # Split output across multiple fields to avoid Discord's 1024-char field limit
+            def _add_chunked_fields(embed: discord.Embed, title: str, lines_in: list[str], max_len: int = 1024):
+                chunk: list[str] = []
+                chunk_len = 0
+                part = 1
+
+                for line in lines_in:
+                    # +1 accounts for the newline that will be inserted when joining
+                    add_len = len(line) + (1 if chunk else 0)
+
+                    # If a single line is too long (shouldn't happen, but be safe), trim it
+                    if len(line) > max_len:
+                        line = line[: max_len - 1] + "…"
+                        add_len = len(line) + (1 if chunk else 0)
+
+                    if chunk_len + add_len > max_len:
+                        embed.add_field(
+                            name=f"{title} (Part {part})",
+                            value="\n".join(chunk) if chunk else "No data.",
+                            inline=False,
+                        )
+                        part += 1
+                        chunk = [line]
+                        chunk_len = len(line)
+                    else:
+                        chunk.append(line)
+                        chunk_len += add_len
+
+                if chunk:
+                    embed.add_field(
+                        name=f"{title} (Part {part})" if part > 1 else title,
+                        value="\n".join(chunk) if chunk else "No data.",
+                        inline=False,
+                    )
+
+            want_hours = int(hours or 12)
+            _add_chunked_fields(emb, "Forecast", lines[:want_hours])
             await inter.followup.send(embed=emb)
         except Exception as e:
             await inter.followup.send(f"\u26A0\ufe0f Hourly error: {e}", ephemeral=True)
