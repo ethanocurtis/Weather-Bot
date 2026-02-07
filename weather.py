@@ -8,6 +8,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List, Tuple
 
+from astral import moon
+
 import discord
 from discord.ext import tasks, commands
 from discord import app_commands
@@ -55,6 +57,30 @@ WX_CODE_MAP = {
     99: ("\u26C8\ufe0f", "Severe thunderstorm with hail"),
 }
 
+
+# ---- Moon phase helpers (Astral) ----
+# Astral's moon.phase() returns a number on ~0..28 scale for the given date.
+# We'll map that to 8 familiar phases for display.
+_MOON_PHASES_8 = [
+    ("New Moon", "🌑"),
+    ("Waxing Crescent", "🌒"),
+    ("First Quarter", "🌓"),
+    ("Waxing Gibbous", "🌔"),
+    ("Full Moon", "🌕"),
+    ("Waning Gibbous", "🌖"),
+    ("Last Quarter", "🌗"),
+    ("Waning Crescent", "🌘"),
+]
+
+def moon_phase_info_for_date(d: datetime) -> Tuple[str, str, float]:
+    """Return (name, emoji, age_days) for the date in d (local date is used)."""
+    # Use local date component
+    date = d.date()
+    p = float(moon.phase(date))  # 0..~28
+    idx = int((p / 28.0) * 8 + 0.5) % 8
+    name, emoji = _MOON_PHASES_8[idx]
+    age_days = round(p, 1)
+    return name, emoji, age_days
 def wx_icon_desc(code: int):
     icon, desc = WX_CODE_MAP.get(int(code), ("\U0001F321\ufe0f", "Weather"))
     return icon, desc
@@ -323,7 +349,53 @@ class Weather(commands.Cog):
 
         await inter.followup.send("✅ Thanks! Your feature request was sent.", ephemeral=True)
 
-    @app_commands.command(name="weather"
+    
+    @app_commands.command(name="moon", description="Show today's moon phase (uses your saved ZIP if you omit it).")
+    @app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
+    async def moon_cmd(self, inter: discord.Interaction, zip: Optional[str] = None):
+        """Moon phase by date (and optionally by ZIP to show the location)."""
+        if self.store is None:
+            return await inter.response.send_message("Storage backend not available.", ephemeral=True)
+
+        # Resolve ZIP (optional, just to show city/state like /weather does)
+        z = None
+        if zip and str(zip).strip():
+            z = re.sub(r"[^0-9]", "", str(zip))
+            if len(z) != 5:
+                return await inter.response.send_message("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+        else:
+            saved = self.store.get_user_zip(inter.user.id)
+            if saved and len(str(saved)) == 5:
+                z = str(saved)
+
+        title_loc = ""
+        if z:
+            try:
+                async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                    async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
+                        if r.status == 200:
+                            zp = await r.json()
+                            place = zp["places"][0]
+                            city = place["place name"]; state = place["state abbreviation"]
+                            title_loc = f" — {city}, {state} {z}"
+            except Exception:
+                # If ZIP lookup fails, still show phase
+                pass
+
+        tz = _chicago_tz_for(datetime.now())
+        now_local = datetime.now(tz)
+        name, emoji, age = moon_phase_info_for_date(now_local)
+
+        emb = discord.Embed(
+            title=f"{emoji} Moon Phase{title_loc}",
+            description=f"**{name}**",
+            colour=discord.Colour.blurple()
+        )
+        emb.add_field(name="Moon age", value=f"{age} days", inline=True)
+        emb.set_footer(text=f"Date: {now_local.strftime('%Y-%m-%d')} ({tz.key if hasattr(tz,'key') else 'local'})")
+        await inter.response.send_message(embed=emb)
+
+@app_commands.command(name="weather"
 , description="Current weather by ZIP. Uses your saved ZIP if omitted.")
     @app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
     async def weather_cmd(self, inter: discord.Interaction, zip: Optional[str] = None):

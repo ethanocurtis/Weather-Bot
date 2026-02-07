@@ -33,6 +33,7 @@ Data is stored in `./data/wxbot.sqlite3` on the host.
 ## Commands (slash)
 
 - `/weather [zip]` – current weather + today's details (uses saved ZIP if omitted)
+- `/moon [zip]` – show today's moon phase (uses saved ZIP if omitted)
 - `/weather_set_zip <zip>` – save your default ZIP
 - `/weather_subscribe time:<HH:MM or 7:30pm> cadence:<daily|weekly> [zip] [weekly_days:3..10]` – schedule DMs in **Chicago time**
 - `/weather_subscriptions` – list IDs and next run
