@@ -107,19 +107,25 @@ def fmt_sun(dt_str: str):
         except Exception:
             return dt_str
 
-# ---- Time helpers (Chicago) ----
+# ---- Time & user preference helpers ----
 try:
     from zoneinfo import ZoneInfo
 except Exception:
     ZoneInfo = None
 
-def _chicago_tz_for(dt_naive: datetime):
+def _tzinfo_from_name(tz_name: str):
+    """Best-effort tzinfo for an IANA tz name. Falls back to DEFAULT_TZ_NAME."""
+    tz_name = (tz_name or "").strip() or DEFAULT_TZ_NAME
     if ZoneInfo is not None:
         try:
-            return ZoneInfo(DEFAULT_TZ_NAME)
+            return ZoneInfo(tz_name)
         except Exception:
-            pass
-    # Fallback manual DST calc
+            try:
+                return ZoneInfo(DEFAULT_TZ_NAME)
+            except Exception:
+                pass
+    # Fallback manual DST calc for America/Chicago only
+    dt_naive = datetime.now()
     y = dt_naive.year
     march8 = datetime(y, 3, 8)
     second_sun_march = march8 + timedelta(days=(6 - march8.weekday()) % 7)
@@ -127,6 +133,19 @@ def _chicago_tz_for(dt_naive: datetime):
     first_sun_nov = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
     is_dst = second_sun_march <= dt_naive < first_sun_nov
     return timezone(timedelta(hours=-5 if is_dst else -6))
+
+def _get_user_tz_name(store, user_id: int) -> str:
+    if store is None:
+        return DEFAULT_TZ_NAME
+    tz = store.get_note(int(user_id), "wx_tz")
+    return (tz or DEFAULT_TZ_NAME).strip() or DEFAULT_TZ_NAME
+
+def _get_user_units(store, user_id: int) -> str:
+    """Return 'standard' or 'metric'."""
+    if store is None:
+        return "standard"
+    u = (store.get_note(int(user_id), "wx_units") or "standard").strip().lower()
+    return u if u in {"standard", "metric"} else "standard"
 
 def _parse_time(time_str: str):
     t = time_str.strip().lower().replace(" ", "")
@@ -147,8 +166,8 @@ def _next_local_run(now_local: datetime, hh: int, mi: int, cadence: str) -> date
         target += timedelta(days=1 if cadence == "daily" else 7)
     return target
 
-def _fmt_local(dt_utc: datetime):
-    return dt_utc.astimezone(_chicago_tz_for(datetime.now())).strftime("%m-%d-%Y %H:%M %Z")
+def _fmt_local(dt_utc: datetime, tz_name: str):
+    return dt_utc.astimezone(_tzinfo_from_name(tz_name)).strftime("%m-%d-%Y %H:%M %Z")
 
 async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str):
     async with session.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=aiohttp.ClientTimeout(total=12)) as r:
@@ -160,13 +179,17 @@ async def _zip_to_place_and_coords(session: aiohttp.ClientSession, zip_code: str
     lat = float(place["latitude"]); lon = float(place["longitude"])
     return city, state, lat, lon
 
-async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str = "auto"):
+async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float, days: int, tz_name: str, units: str):
+    units = (units or "standard").lower()
+    temp_unit = "fahrenheit" if units == "standard" else "celsius"
+    wind_unit = "mph" if units == "standard" else "kmh"
+    precip_unit = "inch" if units == "standard" else "mm"
     params = {
         "latitude": lat, "longitude": lon,
         "timezone": tz_name,
-        "temperature_unit": "fahrenheit",
-        "wind_speed_unit": "mph",
-        "precipitation_unit": "inch",
+        "temperature_unit": temp_unit,
+        "wind_speed_unit": wind_unit,
+        "precipitation_unit": precip_unit,
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset,uv_index_max",
     }
     async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
@@ -201,12 +224,77 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
         if hi is not None and lo is not None:
             parts.append(f"**{round(hi)}° / {round(lo)}°**")
         if wm is not None:
-            parts.append(f"\U0001F4A8 {round(wm)} mph")
+            parts.append(f"\U0001F4A8 {round(wm)} {wind_unit}")
         if pp is not None:
             parts.append(f"\u2614 {int(pp)}%")
-        parts.append(f"\U0001F4CF {pr:.2f} in")
+        parts.append(f"\U0001F4CF {pr:.2f} {precip_unit}")
         line = f"{icon} {desc} — " + " - ".join(parts)
         out.append((d, line, sunrise, sunset, uv, hi))
+    return out
+
+
+async def _fetch_hourly(session: aiohttp.ClientSession, lat: float, lon: float, tz_name: str, units: str, hours: int = 12):
+    """Return a list of hourly forecast rows for the next N hours.
+
+    Each item: (time_str, weather_code, temp, precip_prob, precip_amt, wind)
+    time_str is in the requested timezone.
+    """
+    units = (units or "standard").lower()
+    temp_unit = "fahrenheit" if units == "standard" else "celsius"
+    wind_unit = "mph" if units == "standard" else "kmh"
+    precip_unit = "inch" if units == "standard" else "mm"
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "timezone": tz_name,
+        "temperature_unit": temp_unit,
+        "wind_speed_unit": wind_unit,
+        "precipitation_unit": precip_unit,
+        "hourly": "temperature_2m,weather_code,precipitation_probability,precipitation,wind_speed_10m",
+    }
+    async with session.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200:
+            raise RuntimeError("Weather API unavailable.")
+        data = await r.json()
+
+    hourly = data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    codes = hourly.get("weather_code") or []
+    pops  = hourly.get("precipitation_probability") or []
+    precs = hourly.get("precipitation") or []
+    winds = hourly.get("wind_speed_10m") or []
+
+    # Find the index closest to "now" in the requested timezone.
+    tz = _tzinfo_from_name(tz_name)
+    now_local = datetime.now(tz)
+
+    start_idx = 0
+    for i, ts in enumerate(times):
+        try:
+            # Open-Meteo returns local time strings when timezone is set.
+            t_local = datetime.fromisoformat(ts)
+            if t_local >= now_local.replace(tzinfo=None):
+                start_idx = i
+                break
+        except Exception:
+            continue
+
+    end_idx = min(len(times), start_idx + max(1, int(hours)))
+    out = []
+    for i in range(start_idx, end_idx):
+        out.append((
+            times[i],
+            int(codes[i]) if i < len(codes) else 0,
+            temps[i] if i < len(temps) else None,
+            pops[i] if i < len(pops) else None,
+            precs[i] if i < len(precs) else None,
+            winds[i] if i < len(winds) else None,
+            wind_unit,
+            precip_unit,
+            "°F" if units == "standard" else "°C",
+        ))
     return out
 
 # ---- NWS alerts helpers ----
@@ -382,7 +470,8 @@ class Weather(commands.Cog):
                 # If ZIP lookup fails, still show phase
                 pass
 
-        tz = _chicago_tz_for(datetime.now())
+        tz_name = _get_user_tz_name(self.store, inter.user.id)
+        tz = _tzinfo_from_name(tz_name)
         now_local = datetime.now(tz)
         name, emoji, age = moon_phase_info_for_date(now_local)
 
@@ -392,46 +481,57 @@ class Weather(commands.Cog):
             colour=discord.Colour.blurple()
         )
         emb.add_field(name="Moon age", value=f"{age} days", inline=True)
-        emb.set_footer(text=f"Date: {now_local.strftime('%Y-%m-%d')} ({tz.key if hasattr(tz,'key') else 'local'})")
+        emb.set_footer(text=f"Date: {now_local.strftime('%Y-%m-%d')} ({tz_name})")
         await inter.response.send_message(embed=emb)
 
-@app_commands.command(name="weather"
-, description="Current weather by ZIP. Uses your saved ZIP if omitted.")
+    @app_commands.command(name="weather", description="Current weather by ZIP. Uses your saved ZIP if omitted.")
     @app_commands.describe(zip="Optional ZIP; uses your saved default if omitted")
     async def weather_cmd(self, inter: discord.Interaction, zip: Optional[str] = None):
         if self.store is None:
             return await inter.response.send_message("Storage backend not available.", ephemeral=True)
         await inter.response.defer()
+
         # Resolve ZIP
         if not zip or not str(zip).strip():
             saved = self.store.get_user_zip(inter.user.id)
             if not saved or len(str(saved)) != 5:
                 return await inter.followup.send(
                     "You didn’t provide a ZIP and no default is saved. Set one with `/weather_set_zip 60601` or pass a ZIP.",
-                    ephemeral=True
+                    ephemeral=True,
                 )
             z = str(saved)
         else:
             z = re.sub(r"[^0-9]", "", str(zip))
             if len(z) != 5:
                 return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+
+        units = _get_user_units(self.store, inter.user.id)
+        tz_name = _get_user_tz_name(self.store, inter.user.id)
+        temp_unit = "fahrenheit" if units == "standard" else "celsius"
+        wind_unit = "mph" if units == "standard" else "kmh"
+        precip_unit = "inch" if units == "standard" else "mm"
+        deg = "°F" if units == "standard" else "°C"
+
+        def _to_f(val):
+            if val is None:
+                return None
+            try:
+                v = float(val)
+                return v if units == "standard" else (v * 9.0 / 5.0 + 32.0)
+            except Exception:
+                return None
+
         try:
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-                # ZIP -> coords
-                async with session.get(f"https://api.zippopotam.us/us/{z}", timeout=aiohttp.ClientTimeout(total=12)) as r:
-                    if r.status != 200:
-                        return await inter.followup.send("Couldn't look up that ZIP.", ephemeral=True)
-                    zp = await r.json()
-                place = zp["places"][0]
-                lat = float(place["latitude"]); lon = float(place["longitude"])
-                city = place["place name"]; state = place["state abbreviation"]
-                # Weather data
+                city, state, lat, lon = await _zip_to_place_and_coords(session, z)
+
                 params = {
-                    "latitude": lat, "longitude": lon,
-                    "temperature_unit": "fahrenheit",
-                    "wind_speed_unit": "mph",
-                    "precipitation_unit": "inch",
-                    "timezone": "auto",
+                    "latitude": lat,
+                    "longitude": lon,
+                    "temperature_unit": temp_unit,
+                    "wind_speed_unit": wind_unit,
+                    "precipitation_unit": precip_unit,
+                    "timezone": tz_name,
                     "current": "temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code",
                     "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max",
                 }
@@ -449,46 +549,177 @@ class Weather(commands.Cog):
             pcp = cur.get("precipitation", 0.0)
             code_now = cur.get("weather_code")
             daily = wx.get("daily") or {}
+
             icon, desc = wx_icon_desc((daily.get("weather_code") or [code_now or 0])[0])
             hi = (daily.get("temperature_2m_max") or [None])[0]
             lo = (daily.get("temperature_2m_min") or [None])[0]
-            prcp_sum = (daily.get("precipitation_sum") or [0.0])[0]
             prcp_prob = (daily.get("precipitation_probability_max") or [None])[0]
             uv = (daily.get("uv_index_max") or [None])[0]
             sunrise = (daily.get("sunrise") or [None])[0]
             sunset = (daily.get("sunset") or [None])[0]
             wind_max = (daily.get("wind_speed_10m_max") or [None])[0]
 
+            color_temp_f = _to_f(t)
+            if color_temp_f is None:
+                color_temp_f = _to_f(hi)
             emb = discord.Embed(
                 title=f"{icon} Weather — {city}, {state} {z}",
                 description=f"**{desc}**",
-                colour=wx_color_from_temp_f(t if t is not None else (hi if hi is not None else 70))
+                colour=wx_color_from_temp_f(color_temp_f if color_temp_f is not None else 70),
             )
+
             if t is not None:
-                emb.add_field(name="Now", value=f"**{round(t)}°F** (feels {round(feels)}°)", inline=True)
+                emb.add_field(name="Now", value=f"**{round(float(t))}{deg}** (feels {round(float(feels))}{deg})", inline=True)
             if hi is not None and lo is not None:
-                emb.add_field(name="Today", value=f"High **{round(hi)}°** / Low **{round(lo)}°**", inline=True)
+                emb.add_field(name="Today", value=f"High **{round(float(hi))}{deg}** / Low **{round(float(lo))}{deg}**", inline=True)
             if rh is not None:
                 emb.add_field(name="Humidity", value=f"{int(rh)}%", inline=True)
             if wind is not None:
-                wind_txt = f"{round(wind)} mph"
+                wind_txt = f"{round(float(wind))} {wind_unit}"
                 if gust is not None:
-                    wind_txt += f" (gusts {round(gust)} mph)"
+                    wind_txt += f" (gusts {round(float(gust))} {wind_unit})"
                 emb.add_field(name="Wind", value=wind_txt, inline=True)
-            emb.add_field(name="Precip (now)", value=f"{pcp:.2f} in", inline=True)
+            emb.add_field(name="Precip (now)", value=f"{float(pcp):.2f} {precip_unit}", inline=True)
             if prcp_prob is not None:
                 emb.add_field(name="Precip Chance", value=f"{int(prcp_prob)}%", inline=True)
             if wind_max is not None:
-                emb.add_field(name="Max Wind Today", value=f"{round(wind_max)} mph", inline=True)
+                emb.add_field(name="Max Wind Today", value=f"{round(float(wind_max))} {wind_unit}", inline=True)
             if uv is not None:
-                emb.add_field(name="UV Index (max)", value=str(round(uv, 1)), inline=True)
+                emb.add_field(name="UV Index (max)", value=str(round(float(uv), 1)), inline=True)
             if sunrise:
                 emb.add_field(name="Sunrise", value=fmt_sun(sunrise), inline=True)
             if sunset:
                 emb.add_field(name="Sunset", value=fmt_sun(sunset), inline=True)
+
+            # Moon phase (in user's timezone)
+            tz = _tzinfo_from_name(tz_name)
+            now_local = datetime.now(tz)
+            m_name, m_emoji, m_age = moon_phase_info_for_date(now_local)
+            emb.add_field(name="Moon", value=f"{m_emoji} {m_name} ({m_age}d)", inline=True)
+
+            emb.set_footer(text=f"Units: {units} • Timezone: {tz_name}")
             await inter.followup.send(embed=emb)
         except Exception as e:
             await inter.followup.send(f"\u26A0\ufe0f Weather error: {e}", ephemeral=True)
+
+    # ---- User settings ----
+    UNITS_CHOICES = [
+        app_commands.Choice(name="standard (°F, mph, in)", value="standard"),
+        app_commands.Choice(name="metric (°C, km/h, mm)", value="metric"),
+    ]
+
+    @app_commands.command(name="units", description="Set your weather units preference (standard or metric).")
+    @app_commands.choices(mode=UNITS_CHOICES)
+    async def units_cmd(self, inter: discord.Interaction, mode: app_commands.Choice[str]):
+        if self.store is None:
+            return await inter.response.send_message("Storage backend not available.", ephemeral=True)
+        val = (mode.value or "standard").lower()
+        if val not in {"standard", "metric"}:
+            val = "standard"
+        self.store.set_note(inter.user.id, "wx_units", val)
+        await inter.response.send_message(f"✅ Units saved: **{val}**", ephemeral=True)
+
+    @app_commands.command(name="timezone", description="Set your timezone for hourly forecasts and scheduling.")
+    @app_commands.describe(tz_name="IANA timezone name (e.g., America/Chicago, America/New_York, Europe/London)")
+    async def timezone_cmd(self, inter: discord.Interaction, tz_name: str):
+        if self.store is None:
+            return await inter.response.send_message("Storage backend not available.", ephemeral=True)
+        tz_name = (tz_name or "").strip()
+        if not tz_name:
+            return await inter.response.send_message("Please provide a timezone name like **America/Chicago**.", ephemeral=True)
+
+        # Validate
+        if ZoneInfo is not None:
+            try:
+                ZoneInfo(tz_name)
+            except Exception:
+                return await inter.response.send_message(
+                    "That timezone name isn't recognized. Example: **America/Chicago** or **America/New_York**.",
+                    ephemeral=True,
+                )
+
+        self.store.set_note(inter.user.id, "wx_tz", tz_name)
+        await inter.response.send_message(f"✅ Timezone saved: **{tz_name}**", ephemeral=True)
+
+    @app_commands.command(name="settings", description="Show your saved weather settings.")
+    async def settings_cmd(self, inter: discord.Interaction):
+        if self.store is None:
+            return await inter.response.send_message("Storage backend not available.", ephemeral=True)
+        z = self.store.get_user_zip(inter.user.id)
+        units = _get_user_units(self.store, inter.user.id)
+        tz_name = _get_user_tz_name(self.store, inter.user.id)
+        await inter.response.send_message(
+            f"**Weather settings**\n"
+            f"• Default ZIP: **{z or 'not set'}**\n"
+            f"• Units: **{units}**\n"
+            f"• Timezone: **{tz_name}**",
+            ephemeral=True,
+        )
+
+    # ---- Hourly forecast ----
+    @app_commands.command(name="hourly", description="Hourly forecast for the next hours (uses your saved ZIP if omitted).")
+    @app_commands.describe(zip="Optional ZIP; uses your saved default if omitted", hours="How many hours to show (6-24)")
+    async def hourly_cmd(self, inter: discord.Interaction, zip: Optional[str] = None, hours: Optional[app_commands.Range[int, 6, 24]] = 12):
+        if self.store is None:
+            return await inter.response.send_message("Storage backend not available.", ephemeral=True)
+        await inter.response.defer()
+
+        # Resolve ZIP
+        if not zip or not str(zip).strip():
+            saved = self.store.get_user_zip(inter.user.id)
+            if not saved or len(str(saved)) != 5:
+                return await inter.followup.send(
+                    "You didn’t provide a ZIP and no default is saved. Set one with `/weather_set_zip 60601` or pass a ZIP.",
+                    ephemeral=True,
+                )
+            z = str(saved)
+        else:
+            z = re.sub(r"[^0-9]", "", str(zip))
+            if len(z) != 5:
+                return await inter.followup.send("Please give a valid 5‑digit US ZIP.", ephemeral=True)
+
+        units = _get_user_units(self.store, inter.user.id)
+        tz_name = _get_user_tz_name(self.store, inter.user.id)
+
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                city, state, lat, lon = await _zip_to_place_and_coords(session, z)
+                rows = await _fetch_hourly(session, lat, lon, tz_name=tz_name, units=units, hours=int(hours or 12))
+
+            deg = rows[0][8] if rows else ("°F" if units == "standard" else "°C")
+            wind_unit = rows[0][6] if rows else ("mph" if units == "standard" else "kmh")
+            precip_unit = rows[0][7] if rows else ("inch" if units == "standard" else "mm")
+
+            emb = discord.Embed(
+                title=f"🕒 Hourly Forecast — {city}, {state} {z}",
+                description=f"Next **{int(hours or 12)}** hours • Units: **{units}** • TZ: **{tz_name}**",
+                colour=discord.Colour.blurple(),
+            )
+
+            lines = []
+            for ts, code, temp, pop, prec, wind, wunit, punit, degsym in rows:
+                try:
+                    t_local = datetime.fromisoformat(ts)
+                    label = t_local.strftime("%-I %p")
+                except Exception:
+                    label = ts[11:16]
+                icon, desc = wx_icon_desc(code)
+                parts = []
+                if temp is not None:
+                    parts.append(f"{round(float(temp))}{degsym}")
+                if pop is not None:
+                    parts.append(f"☔ {int(pop)}%")
+                if wind is not None:
+                    parts.append(f"💨 {round(float(wind))} {wunit}")
+                if prec is not None:
+                    parts.append(f"📏 {float(prec):.2f} {punit}")
+                lines.append(f"**{label}** — {icon} {desc} — " + " • ".join(parts))
+
+            # Keep embed size reasonable
+            emb.add_field(name="Forecast", value="\n".join(lines[:24]) or "No data.", inline=False)
+            await inter.followup.send(embed=emb)
+        except Exception as e:
+            await inter.followup.send(f"\u26A0\ufe0f Hourly error: {e}", ephemeral=True)
 
     @app_commands.command(name="weather_set_zip", description="Set your default ZIP code for weather features.")
     async def weather_set_zip(self, inter: discord.Interaction, zip: app_commands.Range[str, 5, 10]):
@@ -500,9 +731,9 @@ class Weather(commands.Cog):
         self.store.set_user_zip(inter.user.id, z)
         await inter.response.send_message(f"\u2705 Saved default ZIP: **{z}**", ephemeral=True)
 
-    @app_commands.command(name="weather_subscribe", description="Subscribe to a daily or weekly weather DM at a Chicago-time hour.")
+    @app_commands.command(name="weather_subscribe", description="Subscribe to a daily or weekly weather DM at a local-time hour.")
     @app_commands.describe(
-        time="HH:MM (24h), HHMM, or h:mma/pm in Chicago time",
+        time="HH:MM (24h), HHMM, or h:mma/pm in YOUR saved timezone",
         cadence="daily or weekly",
         zip="Optional ZIP; uses your saved ZIP if omitted",
         weekly_days="For weekly: number of days to include (3, 7, or 10)"
@@ -524,7 +755,10 @@ class Weather(commands.Cog):
             z = re.sub(r"[^0-9]", "", zip) if zip else (self.store.get_user_zip(inter.user.id) or "")
             if len(z) != 5:
                 return await inter.followup.send("Set a ZIP with `/weather_set_zip` or provide it here.", ephemeral=True)
-            now_local = datetime.now(_chicago_tz_for(datetime.now()))
+            tz_name = _get_user_tz_name(self.store, inter.user.id)
+            tz = _tzinfo_from_name(tz_name)
+            units = _get_user_units(self.store, inter.user.id)
+            now_local = datetime.now(tz)
             first_local = _next_local_run(now_local, hh, mi, cadence.value)
             next_run_utc = first_local.astimezone(timezone.utc)
             sub = {
@@ -534,12 +768,15 @@ class Weather(commands.Cog):
                 "hh": int(hh),
                 "mi": int(mi),
                 "weekly_days": int(weekly_days or 7),
+                "tz_name": tz_name,
+                "units": units,
                 "next_run_utc": next_run_utc.isoformat(),
             }
             sid = self.store.add_weather_sub(sub)
             await inter.followup.send(
-                f"\U0001F324\ufe0f Subscribed **#{sid}** — {cadence.value} at **{first_local.strftime('%I:%M %p %Z')}** for ZIP **{z}**.\n"
-                + ("Weekly outlook length: **{} days**.".format(sub['weekly_days']) if cadence.value == "weekly" else "Daily: Today & Tomorrow."),
+                f"\U0001F324\ufe0f Subscribed **#{sid}** — {cadence.value} at **{first_local.strftime('%I:%M %p')}** ({tz_name}) for ZIP **{z}**.\n"
+                + ("Weekly outlook length: **{} days**.".format(sub['weekly_days']) if cadence.value == "weekly" else "Daily: Today & Tomorrow.")
+                + f"\nUnits: **{units}**",
                 ephemeral=True
             )
         except Exception as e:
@@ -555,10 +792,12 @@ class Weather(commands.Cog):
             return await inter.followup.send("You have no weather subscriptions.", ephemeral=True)
 
         out_lines = []
-        tz = _chicago_tz_for(datetime.now())
-        now_local = datetime.now(tz)
 
         for s in items:
+            tz_name = (s.get("tz_name") or "").strip() or _get_user_tz_name(self.store, inter.user.id)
+            tz = _tzinfo_from_name(tz_name)
+            now_local = datetime.now(tz)
+            units = (s.get("units") or "").strip() or _get_user_units(self.store, inter.user.id)
             hh = int(s.get("hh", 8))
             mi = int(s.get("mi", 0))
             cadence = s.get("cadence", "daily") if s.get("cadence") in {"daily", "weekly"} else "daily"
@@ -583,7 +822,7 @@ class Weather(commands.Cog):
                 self.store.update_weather_sub(s["id"], user_id=int(s["user_id"]), next_run_utc=nxt.isoformat())
 
             out_lines.append(
-                f"**#{s['id']}** — {cadence} at {hh:02d}:{mi:02d} CT - ZIP {s.get('zip','?????')} - next: {_fmt_local(nxt)}"
+                f"**#{s['id']}** — {cadence} at {hh:02d}:{mi:02d} ({tz_name}) - ZIP {s.get('zip','?????')} - units {units} - next: {_fmt_local(nxt, tz_name)}"
             )
 
         await inter.followup.send("\n".join(out_lines), ephemeral=True)
@@ -645,12 +884,20 @@ class Weather(commands.Cog):
                         try:
                             user = await self.bot.fetch_user(int(s["user_id"]))
                             city, state, lat, lon = await _zip_to_place_and_coords(session, s["zip"])
+                            tz_name = (s.get("tz_name") or "").strip() or _get_user_tz_name(self.store, int(s["user_id"]))
+                            units = (s.get("units") or "").strip().lower() or _get_user_units(self.store, int(s["user_id"]))
                             if s["cadence"] == "daily":
-                                outlook = await _fetch_outlook(session, lat, lon, days=2)
+                                outlook = await _fetch_outlook(session, lat, lon, days=2, tz_name=tz_name, units=units)
                                 first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
+                                first_hi_f = None
+                                if first_hi is not None:
+                                    try:
+                                        first_hi_f = float(first_hi) if units == "standard" else (float(first_hi) * 9.0 / 5.0 + 32.0)
+                                    except Exception:
+                                        first_hi_f = None
                                 emb = discord.Embed(
                                     title=f"\U0001F324\ufe0f Daily Outlook — {city}, {state} {s['zip']}",
-                                    colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
+                                    colour=wx_color_from_temp_f(first_hi_f if first_hi_f is not None else 70)
                                 )
                                 for (d, line, sunrise, sunset, uv, _hi) in outlook:
                                     extras = []
@@ -659,29 +906,37 @@ class Weather(commands.Cog):
                                     if uv is not None: extras.append(f"\U0001F506 UV {round(uv,1)}")
                                     value = "\n".join([line, " - ".join(extras)]) if extras else line
                                     emb.add_field(name=d, value=value, inline=False)
-                                emb.set_footer(text="Chicago time schedule")
+                                emb.set_footer(text=f"Scheduled in {tz_name} • Units: {units}")
                                 await user.send(embed=emb)
-                                next_local = datetime.now(_chicago_tz_for(datetime.now()))
+                                tz = _tzinfo_from_name(tz_name)
+                                next_local = datetime.now(tz)
                                 next_local = next_local.replace(hour=s["hh"], minute=s["mi"], second=0, microsecond=0)
-                                if next_local <= datetime.now(_chicago_tz_for(datetime.now())):
+                                if next_local <= datetime.now(tz):
                                     next_local += timedelta(days=1)
                                 self.store.update_weather_sub(s["id"], user_id=int(s["user_id"]), next_run_utc=next_local.astimezone(timezone.utc).isoformat())
                             else:
                                 days = int(s.get("weekly_days", 7))
                                 days = 10 if days > 10 else (3 if days < 3 else days)
-                                outlook = await _fetch_outlook(session, lat, lon, days=days)
+                                outlook = await _fetch_outlook(session, lat, lon, days=days, tz_name=tz_name, units=units)
                                 first_hi = outlook[0][5] if outlook and outlook[0][5] is not None else None
+                                first_hi_f = None
+                                if first_hi is not None:
+                                    try:
+                                        first_hi_f = float(first_hi) if units == "standard" else (float(first_hi) * 9.0 / 5.0 + 32.0)
+                                    except Exception:
+                                        first_hi_f = None
                                 emb = discord.Embed(
                                     title=f"\U0001F5D3\ufe0f Weekly Outlook ({days} days) — {city}, {state} {s['zip']}",
-                                    colour=wx_color_from_temp_f(first_hi if first_hi is not None else 70)
+                                    colour=wx_color_from_temp_f(first_hi_f if first_hi_f is not None else 70)
                                 )
                                 for (d, line, _sunrise, _sunset, _uv, _hi) in outlook:
                                     emb.add_field(name=d, value=line, inline=False)
-                                emb.set_footer(text="Chicago time schedule")
+                                emb.set_footer(text=f"Scheduled in {tz_name} • Units: {units}")
                                 await user.send(embed=emb)
-                                next_local = datetime.now(_chicago_tz_for(datetime.now()))
+                                tz = _tzinfo_from_name(tz_name)
+                                next_local = datetime.now(tz)
                                 next_local = next_local.replace(hour=s["hh"], minute=s["mi"], second=0, microsecond=0)
-                                if next_local <= datetime.now(_chicago_tz_for(datetime.now())):
+                                if next_local <= datetime.now(tz):
                                     next_local += timedelta(days=7)
                                 else:
                                     next_local += timedelta(days=7)

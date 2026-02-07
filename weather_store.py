@@ -34,6 +34,8 @@ class WxStore:
                 hh INTEGER NOT NULL,
                 mi INTEGER NOT NULL,
                 weekly_days INTEGER,
+                tz_name TEXT,
+                units TEXT,
                 next_run_utc TEXT NOT NULL
             )
             """
@@ -54,6 +56,18 @@ class WxStore:
 
         self.db.commit()
 
+        # ---- Lightweight migrations (older DBs) ----
+        try:
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(weather_subs)").fetchall()}
+            if "tz_name" not in cols:
+                self.db.execute("ALTER TABLE weather_subs ADD COLUMN tz_name TEXT")
+            if "units" not in cols:
+                self.db.execute("ALTER TABLE weather_subs ADD COLUMN units TEXT")
+            self.db.commit()
+        except Exception:
+            # Best-effort: if migration fails, bot still runs with defaults
+            pass
+
     def get_user_zip(self, user_id: int) -> Optional[str]:
         row = self.db.execute("SELECT zip FROM weather_zips WHERE user_id = ?", (int(user_id),)).fetchone()
         return row["zip"] if row else None
@@ -72,8 +86,8 @@ class WxStore:
         cur = self.db.cursor()
         cur.execute(
             """
-            INSERT INTO weather_subs(user_id, zip, cadence, hh, mi, weekly_days, next_run_utc)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO weather_subs(user_id, zip, cadence, hh, mi, weekly_days, tz_name, units, next_run_utc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(sub["user_id"]),
@@ -82,6 +96,8 @@ class WxStore:
                 int(sub["hh"]),
                 int(sub["mi"]),
                 int(sub.get("weekly_days") or 0),
+                str(sub.get("tz_name") or ""),
+                str(sub.get("units") or ""),
                 str(sub["next_run_utc"]),
             ),
         )
@@ -93,7 +109,7 @@ class WxStore:
         if user_id is None:
             rows = self.db.execute(
                 """
-                SELECT id, user_id, zip, cadence, hh, mi, weekly_days, next_run_utc
+                SELECT id, user_id, zip, cadence, hh, mi, weekly_days, tz_name, units, next_run_utc
                 FROM weather_subs
                 ORDER BY next_run_utc ASC
                 """
@@ -102,7 +118,7 @@ class WxStore:
 
         rows = self.db.execute(
             """
-            SELECT id, user_id, zip, cadence, hh, mi, weekly_days, next_run_utc
+            SELECT id, user_id, zip, cadence, hh, mi, weekly_days, tz_name, units, next_run_utc
             FROM weather_subs
             WHERE user_id = ?
             ORDER BY next_run_utc ASC
