@@ -14,6 +14,7 @@ import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 from location_service import search_locations
+from weather_ui import HelpView, SubscriptionDraft, DestinationView, SubscriptionManageView, wizard_embed
 
 # ---- Constants & styling helpers ----
 DEFAULT_TZ_NAME = "America/Chicago"
@@ -361,6 +362,76 @@ class Weather(commands.Cog):
     def _is_staff(self, user) -> bool:
         return bool(BOT_OWNER_ID and int(user.id) == BOT_OWNER_ID)
 
+    async def resolve_location_query(self, query: str) -> Dict[str, Any]:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            results = await search_locations(session, query.strip(), 1)
+        if not results:
+            raise ValueError("No matching location was found.")
+        return results[0]
+
+    @staticmethod
+    def parse_subscription_time(value: str) -> Tuple[int, int]:
+        return _parse_time(value)
+
+    @staticmethod
+    def normalize_condition_metric(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+        aliases = {
+            "wind": "max_wind", "max_wind": "max_wind", "maximum_wind": "max_wind",
+            "max_temp": "max_temp", "maximum_temperature": "max_temp", "high_temp": "max_temp",
+            "min_temp": "min_temp", "minimum_temperature": "min_temp", "low_temp": "min_temp",
+            "rain": "rain_chance", "rain_chance": "rain_chance", "chance_of_rain": "rain_chance",
+            "precip": "precipitation", "precipitation": "precipitation",
+            "uv": "uv", "uv_index": "uv",
+        }
+        metric = aliases.get(cleaned)
+        if not metric:
+            raise ValueError("Metric must be max wind, max temp, min temp, rain chance, precipitation, or UV.")
+        return metric
+
+    def create_subscription_from_draft(self, state: SubscriptionDraft):
+        if not all([state.destination_type, state.location, state.cadence]) or state.hh is None or state.mi is None:
+            raise ValueError("The subscription setup is incomplete.")
+        loc = state.location
+        tz_name = loc.get("timezone") or _get_user_tz_name(self.store, state.user_id)
+        first = _next_local_run(datetime.now(_tzinfo_from_name(tz_name)), state.hh, state.mi, state.cadence)
+        sub = {
+            "user_id": state.user_id, "zip": "", "cadence": state.cadence, "hh": state.hh, "mi": state.mi,
+            "weekly_days": state.weekly_days, "tz_name": tz_name, "units": _get_user_units(self.store, state.user_id),
+            "next_run_utc": first.astimezone(timezone.utc).isoformat(), "location_id": loc.get("id"),
+            "location_name": loc["display_name"], "latitude": loc["latitude"], "longitude": loc["longitude"],
+            "country_code": loc.get("country_code"), "destination_type": state.destination_type,
+            "guild_id": state.guild_id, "channel_id": state.channel_id, "created_by": state.user_id,
+            "condition_metric": state.condition_metric, "condition_operator": state.condition_operator,
+            "condition_value": state.condition_value, "condition_unit": _get_user_units(self.store, state.user_id), "enabled": 1,
+        }
+        return self.store.add_weather_sub(sub), first
+
+    def get_manageable_subscription(self, sub_id: int, user, guild=None) -> Dict[str, Any]:
+        row = self.store.get_weather_sub(sub_id)
+        if not row:
+            raise ValueError("Subscription not found.")
+        is_owner = int(row["user_id"]) == int(user.id)
+        is_guild_admin = bool(guild and user.guild_permissions.manage_guild and row.get("guild_id") == guild.id)
+        if not (is_owner or is_guild_admin):
+            raise ValueError("You cannot manage that subscription.")
+        return row
+
+    async def test_subscription(self, sub_id: int, user, guild=None) -> str:
+        sub = self.get_manageable_subscription(sub_id, user, guild)
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            days = 2 if sub["cadence"] == "daily" else max(3, min(10, int(sub.get("weekly_days") or 7)))
+            outlook = await _fetch_outlook(session, float(sub["latitude"]), float(sub["longitude"]), days, sub.get("tz_name") or DEFAULT_TZ_NAME, sub.get("units") or "standard")
+        embed = self._outlook_embed(sub, outlook)
+        embed.description = "**Test delivery** — this does not affect the next scheduled run."
+        if sub.get("destination_type") == "channel":
+            channel = self.bot.get_channel(int(sub["channel_id"])) or await self.bot.fetch_channel(int(sub["channel_id"]))
+            await channel.send(embed=embed)
+            return channel.mention
+        target = self.bot.get_user(int(sub["user_id"])) or await self.bot.fetch_user(int(sub["user_id"]))
+        await target.send(embed=embed)
+        return "your DMs"
+
     async def _resolve_location(self, session, user_id: int, query: Optional[str] = None) -> Dict[str, Any]:
         if query and query.strip():
             return (await search_locations(session, query.strip(), 1))[0]
@@ -423,6 +494,15 @@ class Weather(commands.Cog):
             return await inter.followup.send("Please wait a minute before submitting another request." if str(e)=="cooldown" else "Feedback routing is not configured correctly.", ephemeral=True)
         except ValueError: return await inter.followup.send("Please include a message.", ephemeral=True)
         await inter.followup.send(f"✅ Submitted as **#{rid}**. You’ll be notified when its status changes.", ephemeral=True)
+
+    @app_commands.command(name="help", description="Open the interactive Weather Bot help menu.")
+    async def help_cmd(self, inter: discord.Interaction):
+        embed = discord.Embed(
+            title="🌦️ Weather Bot Help",
+            description="Choose a topic below. You can also create a subscription directly from this menu.",
+            colour=discord.Colour.blurple(),
+        )
+        await inter.response.send_message(embed=embed, view=HelpView(self, inter.user.id), ephemeral=True)
 
     @app_commands.command(name="feedback", description="Send feedback to the bot owner.")
     async def feedback_cmd(self, inter: discord.Interaction, message: str): await self._feedback_command(inter,"feedback",message)
@@ -541,9 +621,15 @@ class Weather(commands.Cog):
         now=datetime.now(_tzinfo_from_name(tz)); name,emoji,age=moon_phase_info_for_date(now)
         await inter.response.send_message(embed=discord.Embed(title=f"{emoji} Moon Phase — {loc['display_name']}",description=f"**{name}**\nMoon age: {age} days"))
 
-    @app_commands.command(name="weather_subscribe", description="Create a DM or server-channel forecast, optionally with a threshold.")
-    @app_commands.describe(destination="dm or channel", metric="max_wind, max_temp, min_temp, rain_chance, precipitation, or uv", operator=">, >=, <, <=", threshold="Only send when condition matches")
-    async def weather_subscribe(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
+    @app_commands.command(name="weather_subscribe", description="Open the guided forecast subscription setup wizard.")
+    async def weather_subscribe(self, inter: discord.Interaction):
+        state = SubscriptionDraft(user_id=inter.user.id)
+        embed = wizard_embed("Where should this report go?", "Choose a personal DM or a server channel.", state)
+        await inter.response.send_message(embed=embed, view=DestinationView(self, state), ephemeral=True)
+
+    @app_commands.command(name="weather_subscribe_advanced", description="Create a subscription using advanced command options.")
+    @app_commands.describe(time="Delivery time, such as 7:00 AM", cadence="daily or weekly", location="City, place, postal code, or saved default", destination="dm or channel", channel="Required for channel delivery", weekly_days="Number of forecast days for weekly reports", metric="max_wind, max_temp, min_temp, rain_chance, precipitation, or uv", operator=">, >=, <, or <=", threshold="Only send when this condition matches")
+    async def weather_subscribe_advanced(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
         await inter.response.defer(ephemeral=True)
         try:
             cadence=cadence.lower(); destination=destination.lower()
@@ -564,18 +650,35 @@ class Weather(commands.Cog):
             await inter.followup.send(f"✅ Subscription **#{sid}** created for **{loc['display_name']}**, delivered to **{channel.mention if channel else 'DM'}**{condition}. Next evaluation: {first.strftime('%Y-%m-%d %I:%M %p %Z')}",ephemeral=True)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
 
-    @app_commands.command(name="weather_subscriptions", description="List your personal and manageable server subscriptions.")
+    @app_commands.command(name="weather_subscriptions", description="Open the subscription management dashboard.")
     async def weather_subscriptions(self, inter: discord.Interaction):
-        rows=self.store.list_weather_subs(inter.user.id)
+        rows = self.store.list_weather_subs(inter.user.id)
         if inter.guild and inter.user.guild_permissions.manage_guild:
-            known={r['id'] for r in rows}; rows += [r for r in self.store.list_weather_subs(guild_id=inter.guild.id) if r['id'] not in known]
-        if not rows: return await inter.response.send_message("No subscriptions found.",ephemeral=True)
-        lines=[]
-        for r in rows:
-            dest=f"<#{r['channel_id']}>" if r.get("destination_type")=="channel" else "DM"; cond=f" · if {r['condition_metric']} {r['condition_operator']} {r['condition_value']}" if r.get("condition_metric") else ""
-            result=f" · last: {r['last_result']}" if r.get("last_result") else ""
-            lines.append(f"**#{r['id']}** {r['cadence']} {r['hh']:02d}:{r['mi']:02d} · {r.get('location_name') or r.get('zip')} · {dest}{cond}{result}")
-        await inter.response.send_message("\n".join(lines),ephemeral=True)
+            known = {r["id"] for r in rows}
+            rows += [r for r in self.store.list_weather_subs(guild_id=inter.guild.id) if r["id"] not in known]
+        if not rows:
+            return await inter.response.send_message("No subscriptions found. Use `/weather_subscribe` to create one.", ephemeral=True)
+        lines = []
+        for row in rows[:25]:
+            dest = f"<#{row['channel_id']}>" if row.get("destination_type") == "channel" else "DM"
+            cond = f" · if {row['condition_metric']} {row['condition_operator']} {row['condition_value']}" if row.get("condition_metric") else " · always"
+            status = "active" if row.get("enabled", 1) else "paused"
+            result = f"\nLast evaluation: {row['last_result']}" if row.get("last_result") else ""
+            lines.append(
+                f"**#{row['id']}** · {status} · {row['cadence']} at {row['hh']:02d}:{row['mi']:02d}\n"
+                f"{row.get('location_name') or row.get('zip')} → {dest}{cond}{result}"
+            )
+        embed = discord.Embed(
+            title="🔔 Subscription Dashboard",
+            description="\n\n".join(lines),
+            colour=discord.Colour.blurple(),
+        )
+        embed.set_footer(text="Choose a subscription below to test, pause/resume, or delete it.")
+        await inter.response.send_message(
+            embed=embed,
+            view=SubscriptionManageView(self, inter.user.id, rows, inter.guild.id if inter.guild else None),
+            ephemeral=True,
+        )
 
     @app_commands.command(name="weather_unsubscribe", description="Remove a weather subscription.")
     async def weather_unsubscribe(self, inter: discord.Interaction, sub_id: int):

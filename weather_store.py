@@ -147,6 +147,10 @@ class WxStore:
         cur = self.db.execute(f"INSERT INTO weather_subs({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", vals)
         self.db.commit(); return int(cur.lastrowid)
 
+    def get_weather_sub(self, sub_id: int) -> Optional[Dict[str, Any]]:
+        row = self.db.execute("SELECT * FROM weather_subs WHERE id=?", (int(sub_id),)).fetchone()
+        return dict(row) if row else None
+
     def list_weather_subs(self, user_id: Optional[int] = None, guild_id: Optional[int] = None, enabled_only: bool = False) -> List[Dict[str, Any]]:
         where, args = [], []
         if user_id is not None: where.append("user_id=?"); args.append(int(user_id))

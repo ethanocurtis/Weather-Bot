@@ -25,6 +25,15 @@ Data is persisted in `./data/wxbot.sqlite3`.
 
 The invite should include the `bot` and `applications.commands` scopes. For server forecast channels, the bot needs **View Channel**, **Send Messages**, and **Embed Links**. The administrator creating a channel subscription needs **Manage Server**.
 
+## What's new in this release
+
+- Interactive `/help` menu organized by topic
+- Guided `/weather_subscribe` wizard with DM/server destination, saved or searched location, daily/weekly schedule, and optional threshold
+- `/weather_subscribe_advanced` preserves the original all-options command for power users
+- Interactive `/weather_subscriptions` dashboard with test delivery, pause/resume, and delete controls
+- Permission checks before server-channel subscriptions are created
+- Test delivery immediately after creating a subscription
+
 ## Main commands
 
 ### Locations and forecasts
@@ -49,10 +58,21 @@ Examples:
 
 ### Forecast subscriptions
 
+Run `/weather_subscribe` to open the guided setup wizard. The wizard asks for:
+
+1. DM or server-channel delivery
+2. A saved location or a new location search
+3. Daily or weekly cadence
+4. Delivery time
+5. Always-send behavior or an optional threshold
+6. Final confirmation
+
+The original command-style flow remains available as `/weather_subscribe_advanced`:
+
 ```text
-/weather_subscribe time:7:00am cadence:daily
-/weather_subscribe time:6:30am cadence:daily destination:channel channel:#weather
-/weather_subscribe time:7:00am cadence:daily metric:max_wind operator:> threshold:20
+/weather_subscribe_advanced time:7:00am cadence:daily
+/weather_subscribe_advanced time:6:30am cadence:daily destination:channel channel:#weather
+/weather_subscribe_advanced time:7:00am cadence:daily metric:max_wind operator:> threshold:20
 ```
 
 Supported threshold metrics:
@@ -68,7 +88,7 @@ The threshold uses the subscription's saved unit system. A skipped conditional r
 
 Management commands:
 
-- `/weather_subscriptions`
+- `/weather_subscriptions` — interactive test, pause/resume, and delete dashboard
 - `/weather_unsubscribe <sub_id>`
 
 Server subscriptions belong to the guild operationally: members with **Manage Server** can list and remove subscriptions for the current server.
@@ -122,6 +142,7 @@ Weather-Bot-main/
 ├── main.py
 ├── weather.py
 ├── weather_store.py
+├── weather_ui.py
 ├── location_service.py
 ├── tests/
 ├── Dockerfile
