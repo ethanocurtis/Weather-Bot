@@ -1,99 +1,137 @@
-# Standalone Discord Weather Bot (Docker)
+# Weather Bot
 
-This is a minimal, production-ready Discord bot that runs in Docker and provides weather commands, daily/weekly DM subscriptions, and NWS alert DMs.
+A Dockerized Discord weather bot with international location search, personal and server forecasts, conditional reports, US NWS alerts, and trackable user feedback.
 
-It uses `weather.py` cog** and wires in a tiny SQLite-backed store so it works standalone.
+## Highlights
 
----
+- Search by city, place name, or postal code worldwide
+- Saved default locations with automatic local timezone detection
+- Current and hourly weather through Open-Meteo
+- Daily or weekly subscriptions delivered by DM or to a server channel
+- Optional thresholds such as `max_wind > 20`, `rain_chance >= 60`, or `min_temp < 32`
+- Persistent feature, bug, and feedback requests with IDs and status notifications
+- US National Weather Service alert DMs
+- SQLite storage with automatic migration of the previous ZIP/DM subscription schema
 
-## Quick Start
-
-1. **Create a Discord application & bot** at <https://discord.com/developers/applications>  
-   - Add a Bot, copy its token
-   - Scopes when inviting: `bot` and `applications.commands`
-   - Bot permissions: sending messages + embed links are sufficient
-
-2. **Configure env**  
-   Copy `.env.example` to `.env` and set your token:
-   ```env
-   DISCORD_TOKEN=your_bot_token_here
-   ```
-
-3. **Build & run with Compose**
-   ```bash
-   docker compose up -d --build
-   ```
-
-4. **Invite the bot** to your server using the OAuth2 URL from the Developer Portal (Scopes: `bot`, `applications.commands`).
-
-Data is stored in `./data/wxbot.sqlite3` on the host.
-
----
-
-## Commands (slash)
-
-- `/weather [zip]` – current weather + today's details (uses saved ZIP if omitted)
-- `/moon [zip]` – show today's moon phase (uses saved ZIP if omitted)
-- `/weather_set_zip <zip>` – save your default ZIP
-- `/weather_subscribe time:<HH:MM or 7:30pm> cadence:<daily|weekly> [zip] [weekly_days:3..10]` – schedule DMs in **Chicago time**
-- `/weather_subscriptions` – list IDs and next run
-- `/weather_unsubscribe <id>` – remove a subscription you own
-- `/wx_alerts <on|off> [zip] [min_severity: advisory|watch|warning]` – enable/disable NWS alerts
-
-### Notes
-- Schedules are in **America/Chicago**; DMs are sent around your chosen minute.
-- APIs used: Zippopotam (ZIP → coords), Open‑Meteo (forecast), and NWS (alerts).
-
----
-
-## Project Layout
-
-```text
-wxbot/
-├─ Dockerfile
-├─ docker-compose.yml
-├─ requirements.txt
-├─ main.py             # bot entrypoint (loads weather cog and syncs commands)
-├─ weather.py          # weather cog
-├─ weather_store.py    # tiny SQLite store
-├─ .env.example
-└─ data/               # persisted by docker-compose (created at runtime)
-```
-
----
-
-## Local (non-Docker) Run
+## Quick start
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-export DISCORD_TOKEN=xxxxx
-python main.py
+cp .env.example .env
+# edit .env and add DISCORD_TOKEN, BOT_OWNER_ID, and optionally FEEDBACK_CHANNEL_ID
+docker compose up -d --build
 ```
 
----
+Data is persisted in `./data/wxbot.sqlite3`.
 
-## Troubleshooting
+The invite should include the `bot` and `applications.commands` scopes. For server forecast channels, the bot needs **View Channel**, **Send Messages**, and **Embed Links**. The administrator creating a channel subscription needs **Manage Server**.
 
-- **Commands not appearing**: global slash commands can take some time to show up the first time after sync. You can also invite the bot to a test guild and use a guild-specific sync if you prefer.
-- **Time zone**: The cog schedules in America/Chicago. That is intentional to mirror original behavior.
-- **Persistence**: Ensure the `./data` folder is writable on the host.
+## Main commands
 
+### Locations and forecasts
 
----
+- `/location_set location:<city, postal code, or place> [name]`
+- `/locations`
+- `/weather [location]`
+- `/hourly [location] [hours:6-24]`
+- `/moon [location]`
+- `/weather_set_zip <zip>` — retained for US compatibility
+- `/units <standard|metric>`
+- `/timezone <IANA timezone>`
+- `/settings`
 
-## Feedback / Feature Requests
+Examples:
 
-This bot is DM-first, so the safest way to collect user feedback is via slash commands.
+```text
+/location_set location:Auckland, New Zealand
+/location_set location:SW1A 1AA, United Kingdom
+/weather location:Christchurch, NZ
+```
 
-1. Set your owner user ID in `.env` as `BOT_OWNER_ID` **or** set `FEEDBACK_CHANNEL_ID` to a private channel in your own server.
-2. Users can then run:
-   - `/feedback <message>`
-   - `/bug <message>`
-   - `/feature <message>`
+### Forecast subscriptions
 
-The bot will forward the message (with user + server context) to your configured destination.
+```text
+/weather_subscribe time:7:00am cadence:daily
+/weather_subscribe time:6:30am cadence:daily destination:channel channel:#weather
+/weather_subscribe time:7:00am cadence:daily metric:max_wind operator:> threshold:20
+```
 
-Notes:
-- There is a basic 60-second per-user cooldown to prevent spam.
-- If you set both `FEEDBACK_CHANNEL_ID` and `BOT_OWNER_ID`, the channel is used.
+Supported threshold metrics:
+
+- `max_wind`
+- `max_temp`
+- `min_temp`
+- `rain_chance`
+- `precipitation`
+- `uv`
+
+The threshold uses the subscription's saved unit system. A skipped conditional report is recorded in `/weather_subscriptions`, so users can see that the scheduler evaluated it successfully.
+
+Management commands:
+
+- `/weather_subscriptions`
+- `/weather_unsubscribe <sub_id>`
+
+Server subscriptions belong to the guild operationally: members with **Manage Server** can list and remove subscriptions for the current server.
+
+After five consecutive delivery failures, a subscription is automatically paused rather than retrying forever.
+
+### Feedback tracking
+
+Users submit through:
+
+- `/feature <message>`
+- `/bug <message>`
+- `/feedback <message>`
+- `/my_requests`
+
+Each submission receives a persistent request number. The configured owner can update it using buttons in the feedback channel or:
+
+```text
+/request_update request_id:184 status:completed note:Released in v2.0
+```
+
+The requester is notified by DM when the status changes. Their status remains visible in `/my_requests` if DMs are blocked.
+
+### US weather alerts
+
+- `/wx_alerts mode:on min_severity:moderate`
+- `/wx_alerts mode:off`
+
+NWS alerts are available only for saved locations in the United States. International forecasts and subscriptions continue to work normally.
+
+## Upgrading from the previous version
+
+The application performs additive SQLite migrations at startup. Existing `weather_zips`, notes, and `weather_subs` rows are preserved.
+
+- Existing ZIP users are converted to a geocoded default location when they next use a location-aware command.
+- Existing subscriptions continue as DM subscriptions.
+- New subscription fields default safely, so the database does not need to be deleted.
+
+Back up `./data/wxbot.sqlite3` before deployment as normal operational practice.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Project layout
+
+```text
+Weather-Bot-main/
+├── main.py
+├── weather.py
+├── weather_store.py
+├── location_service.py
+├── tests/
+├── Dockerfile
+├── docker-compose.yml
+└── data/
+```
+
+## APIs
+
+- Open-Meteo Geocoding API — location search
+- Open-Meteo Forecast API — forecasts
+- National Weather Service API — US alerts
+- Astral — moon phases
