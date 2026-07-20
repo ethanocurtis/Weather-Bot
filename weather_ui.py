@@ -7,39 +7,19 @@ import discord
 
 
 HELP_PAGES = {
-    "weather": (
-        "🌤️ Weather",
-        "Use `/weather` for current conditions, `/hourly` for the next 6–24 hours, and `/moon` for the current moon phase.\n\n"
-        "You can provide a city, postal code, or place directly, or omit it to use your saved default location.",
-    ),
-    "locations": (
-        "📍 Locations",
-        "Use `/location_set` to save a city, place, or postal code anywhere in the world. `/locations` shows your saved locations.\n\n"
-        "Examples: `Auckland, New Zealand`, `SW1A 1AA`, or `Chicago, IL`.",
-    ),
-    "subscriptions": (
-        "🔔 Subscriptions",
-        "Use `/weather_subscribe` to open the guided setup wizard. It walks through destination, location, schedule, and an optional threshold.\n\n"
-        "Use `/weather_subscriptions` to test, pause, resume, or delete existing subscriptions. Power users can use `/weather_subscribe_advanced`.",
-    ),
-    "alerts": (
-        "⚠️ Alerts",
-        "Use `/wx_alerts mode:on` to receive active US National Weather Service alerts by DM. NWS alerts currently require a saved US location.",
-    ),
-    "server": (
-        "🏠 Server Setup",
-        "Server administrators can create scheduled forecasts for a channel through `/weather_subscribe`. Choose **Server channel** in the wizard.\n\n"
-        "The creator needs **Manage Server**. The bot needs **View Channel**, **Send Messages**, and **Embed Links**.",
-    ),
-    "settings": (
-        "⚙️ Settings",
-        "Use `/units` to choose standard or metric units, `/timezone` to set a scheduling timezone, and `/settings` to review your saved preferences.",
-    ),
-    "feedback": (
-        "💬 Feedback",
-        "Use `/feature`, `/bug`, or `/feedback` to contact the bot owner. Each submission receives a request number. `/my_requests` shows its current status.",
-    ),
+    "weather": ("🌤️ Weather & Forecasts", "`/weather` current conditions · `/hourly` hourly forecast · `/moon` moon phase · `/weather_briefing` plain-language weather, air, and pollen summary."),
+    "air": ("🌬️ Air & Pollen", "Use `/air_quality` for US AQI, particulate levels, and available pollen forecasts. Pollen availability varies by region and season."),
+    "locations": ("📍 Locations", "`/location_set` saves a worldwide city, place, or postal code. `/locations` lists saved locations. `/weather_set_zip` remains available for legacy US ZIP setup."),
+    "subscriptions": ("🔔 Personal & Channel Subscriptions", "Use `/weather_subscribe` for the guided wizard. Choose either a forecast outlook or a weather briefing, then destination, location, schedule, and optional threshold. `/weather_subscriptions` manages existing subscriptions; `/weather_subscribe_advanced` is the power-user fallback."),
+    "server_posts": ("📅 Scheduled Server Posts", "Admins can create dedicated daily or weekly channel briefings with `/server_weather_post_create`, list them with `/server_weather_posts`, and remove them with `/server_weather_post_delete`."),
+    "roles": ("🚨 Weather Roles", "Admins use `/weather_roles_setup` for the guided US alert-role wizard. Members then opt in with `/weather_role_join` and opt out with `/weather_role_leave`. The bot needs Manage Roles and must sit above the alert roles."),
+    "sticky": ("📌 Sticky Dashboard", "Admins can create an automatically refreshed weather message with `/sticky_weather_create`, list dashboards with `/sticky_weather_list`, and delete one with `/sticky_weather_delete`."),
+    "alerts": ("⚠️ Personal Alerts", "Use `/wx_alerts mode:on` for active US National Weather Service alerts by DM. NWS alerts require a saved US location."),
+    "settings": ("⚙️ Settings", "`/units` changes standard or metric units, `/timezone` controls scheduling, and `/settings` reviews your preferences."),
+    "feedback": ("💬 Feedback & Requests", "Use `/feature`, `/bug`, or `/feedback`. `/my_requests` shows status updates. Owners can use `/request_update`."),
+    "owner": ("📊 Owner Tools", "The configured bot owner can open `/owner_analytics` for live guild totals, stored usage totals, scheduler activity, and request counts."),
 }
+
 
 
 class OwnedView(discord.ui.View):
@@ -59,13 +39,17 @@ class HelpSelect(discord.ui.Select):
         super().__init__(
             placeholder="Choose a help topic…",
             options=[
-                discord.SelectOption(label="Weather", value="weather", emoji="🌤️"),
+                discord.SelectOption(label="Weather & Forecasts", value="weather", emoji="🌤️"),
+                discord.SelectOption(label="Air & Pollen", value="air", emoji="🌬️"),
                 discord.SelectOption(label="Locations", value="locations", emoji="📍"),
                 discord.SelectOption(label="Subscriptions", value="subscriptions", emoji="🔔"),
-                discord.SelectOption(label="Alerts", value="alerts", emoji="⚠️"),
-                discord.SelectOption(label="Server Setup", value="server", emoji="🏠"),
+                discord.SelectOption(label="Scheduled Server Posts", value="server_posts", emoji="📅"),
+                discord.SelectOption(label="Weather Roles", value="roles", emoji="🚨"),
+                discord.SelectOption(label="Sticky Dashboard", value="sticky", emoji="📌"),
+                discord.SelectOption(label="Personal Alerts", value="alerts", emoji="⚠️"),
                 discord.SelectOption(label="Settings", value="settings", emoji="⚙️"),
                 discord.SelectOption(label="Feedback", value="feedback", emoji="💬"),
+                discord.SelectOption(label="Owner Tools", value="owner", emoji="📊"),
             ],
         )
 
@@ -84,8 +68,8 @@ class HelpView(OwnedView):
     @discord.ui.button(label="Create Subscription", emoji="➕", style=discord.ButtonStyle.success, row=1)
     async def create_subscription(self, interaction: discord.Interaction, _button: discord.ui.Button):
         state = SubscriptionDraft(user_id=interaction.user.id)
-        embed = wizard_embed("Where should this report go?", "Choose a personal DM or a server channel.", state)
-        await interaction.response.edit_message(embed=embed, view=DestinationView(self.cog, state))
+        embed = wizard_embed("What should be delivered?", "Choose a traditional forecast outlook or a plain-language weather briefing.", state)
+        await interaction.response.edit_message(embed=embed, view=ReportTypeView(self.cog, state))
 
 
 @dataclass
@@ -103,11 +87,13 @@ class SubscriptionDraft:
     condition_metric: Optional[str] = None
     condition_operator: Optional[str] = None
     condition_value: Optional[float] = None
+    report_type: str = "forecast"
 
 
 def wizard_embed(title: str, description: str, state: SubscriptionDraft) -> discord.Embed:
     embed = discord.Embed(title=f"🔔 Subscription Setup — {title}", description=description, colour=discord.Colour.blurple())
     details = []
+    details.append(f"**Report:** {'Plain-language briefing' if state.report_type == 'briefing' else 'Forecast outlook'}")
     if state.destination_type:
         details.append(f"**Destination:** {state.channel_mention if state.destination_type == 'channel' else 'My DMs'}")
     if state.location:
@@ -122,6 +108,28 @@ def wizard_embed(title: str, description: str, state: SubscriptionDraft) -> disc
         embed.add_field(name="Current choices", value="\n".join(details), inline=False)
     embed.set_footer(text="This setup menu expires after 5 minutes.")
     return embed
+
+
+class ReportTypeView(OwnedView):
+    def __init__(self, cog, state: SubscriptionDraft):
+        super().__init__(state.user_id)
+        self.cog, self.state = cog, state
+
+    @discord.ui.button(label="Forecast Outlook", emoji="📅", style=discord.ButtonStyle.primary)
+    async def forecast(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.state.report_type = "forecast"
+        await interaction.response.edit_message(
+            embed=wizard_embed("Where should this report go?", "Choose a personal DM or a server channel.", self.state),
+            view=DestinationView(self.cog, self.state),
+        )
+
+    @discord.ui.button(label="Weather Briefing", emoji="🌤️", style=discord.ButtonStyle.success)
+    async def briefing(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.state.report_type = "briefing"
+        await interaction.response.edit_message(
+            embed=wizard_embed("Where should this briefing go?", "Choose a personal DM or a server channel.", self.state),
+            view=DestinationView(self.cog, self.state),
+        )
 
 
 class DestinationView(OwnedView):

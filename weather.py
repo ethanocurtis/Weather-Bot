@@ -14,7 +14,7 @@ import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 from location_service import search_locations
-from weather_ui import HelpView, SubscriptionDraft, DestinationView, SubscriptionManageView, wizard_embed
+from weather_ui import HelpView, SubscriptionDraft, ReportTypeView, SubscriptionManageView, wizard_embed
 
 # ---- Constants & styling helpers ----
 DEFAULT_TZ_NAME = "America/Chicago"
@@ -25,7 +25,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.1.1"
 
 
 
@@ -513,6 +513,147 @@ class OwnerAnalyticsView(discord.ui.View):
         await interaction.response.send_message(embed=discord.Embed(title="Pending Requests", description=text, colour=discord.Colour.blurple()), ephemeral=True)
 
 
+class WeatherRoleLocationModal(discord.ui.Modal, title="Weather alert location"):
+    location = discord.ui.TextInput(label="US city, ZIP code, or place", placeholder="Chicago, IL or 60601", max_length=100)
+
+    def __init__(self, cog, owner_id: int, channel_id: int):
+        super().__init__()
+        self.cog = cog
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                loc = await self.cog._resolve_location(session, interaction.user.id, str(self.location.value))
+            if loc.get("country_code") != "US":
+                return await interaction.followup.send(
+                    "Weather-role alerts currently require a US location because they use the National Weather Service.",
+                    ephemeral=True,
+                )
+            description = (
+                f"**Channel:** <#{self.channel_id}>\n"
+                f"**Location:** {loc['display_name']}\n\n"
+                "Choose the lowest severity that should be posted."
+            )
+            await interaction.edit_original_response(
+                embed=discord.Embed(title="🚨 Minimum Alert Severity", description=description, colour=discord.Colour.blurple()),
+                view=WeatherRoleSeverityView(self.cog, self.owner_id, self.channel_id, loc),
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Could not resolve that location: {exc}", ephemeral=True)
+
+
+class WeatherRoleChannelSelect(discord.ui.ChannelSelect):
+    def __init__(self):
+        super().__init__(placeholder="Choose the alert channel…", channel_types=[discord.ChannelType.text, discord.ChannelType.news])
+
+    async def callback(self, interaction: discord.Interaction):
+        channel = self.values[0]
+        perms = channel.permissions_for(interaction.guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            return await interaction.response.send_message(
+                "I need View Channel, Send Messages, and Embed Links there.", ephemeral=True
+            )
+        await interaction.response.send_modal(WeatherRoleLocationModal(self.view.cog, self.view.owner_id, channel.id))
+
+
+class WeatherRoleChannelView(discord.ui.View):
+    def __init__(self, cog, owner_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.add_item(WeatherRoleChannelSelect())
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This setup belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+
+class WeatherRoleSeverityView(discord.ui.View):
+    def __init__(self, cog, owner_id: int, channel_id: int, loc: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.owner_id = owner_id
+        self.channel_id = channel_id
+        self.loc = loc
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This setup belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    async def finish(self, interaction, severity):
+        guild = interaction.guild
+        if not guild.me.guild_permissions.manage_roles:
+            return await interaction.response.send_message(
+                "I need **Manage Roles** before I can create the opt-in alert roles.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True)
+        role_names = {
+            "storm": "🌩 Storm Alerts",
+            "winter": "🌨 Winter Weather",
+            "tornado": "🌪 Tornado Alerts",
+            "flood": "🌊 Flood Alerts",
+            "heat": "🔥 Heat Alerts",
+        }
+        ids = {}
+        try:
+            for key, name in role_names.items():
+                role = discord.utils.get(guild.roles, name=name)
+                if role is None:
+                    role = await guild.create_role(name=name, mentionable=True, reason="Weather Bot alert-role setup")
+                ids[key] = role.id
+            self.cog.store.set_weather_role_config({
+                "guild_id": guild.id,
+                "channel_id": self.channel_id,
+                "location_name": self.loc["display_name"],
+                "latitude": self.loc["latitude"],
+                "longitude": self.loc["longitude"],
+                "country_code": self.loc.get("country_code"),
+                "timezone": self.loc.get("timezone") or DEFAULT_TZ_NAME,
+                "min_severity": severity,
+                "storm_role_id": ids["storm"],
+                "winter_role_id": ids["winter"],
+                "tornado_role_id": ids["tornado"],
+                "flood_role_id": ids["flood"],
+                "heat_role_id": ids["heat"],
+                "enabled": 1,
+                "created_by": interaction.user.id,
+            })
+            roles_text = "\n".join(f"<@&{role_id}>" for role_id in ids.values())
+            description = (
+                f"Alerts for **{self.loc['display_name']}** will post in <#{self.channel_id}>.\n\n"
+                f"Created or reused:\n{roles_text}\n\n"
+                "Members can use `/weather_role_join` and `/weather_role_leave`."
+            )
+            await interaction.edit_original_response(
+                embed=discord.Embed(title="✅ Weather Roles Ready", description=description, colour=discord.Colour.green()),
+                view=None,
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I could not create or manage the roles. Put my highest role above the alert roles and grant Manage Roles.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Moderate+", style=discord.ButtonStyle.primary)
+    async def moderate(self, interaction, _button):
+        await self.finish(interaction, "moderate")
+
+    @discord.ui.button(label="Severe+", style=discord.ButtonStyle.danger)
+    async def severe(self, interaction, _button):
+        await self.finish(interaction, "severe")
+
+    @discord.ui.button(label="All Alerts", style=discord.ButtonStyle.secondary)
+    async def all_alerts(self, interaction, _button):
+        await self.finish(interaction, "minor")
+
+
 class Weather(commands.Cog):
     """Weather, locations, subscriptions, alerts, and feedback tracking."""
     def __init__(self, bot: commands.Bot, store=None):
@@ -572,7 +713,7 @@ class Weather(commands.Cog):
             "country_code": loc.get("country_code"), "destination_type": state.destination_type,
             "guild_id": state.guild_id, "channel_id": state.channel_id, "created_by": state.user_id,
             "condition_metric": state.condition_metric, "condition_operator": state.condition_operator,
-            "condition_value": state.condition_value, "condition_unit": _get_user_units(self.store, state.user_id), "enabled": 1,
+            "condition_value": state.condition_value, "condition_unit": _get_user_units(self.store, state.user_id), "enabled": 1, "report_type": state.report_type,
         }
         return self.store.add_weather_sub(sub), first
 
@@ -591,8 +732,17 @@ class Weather(commands.Cog):
         async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
             days = 2 if sub["cadence"] == "daily" else max(3, min(10, int(sub.get("weekly_days") or 7)))
             outlook = await _fetch_outlook(session, float(sub["latitude"]), float(sub["longitude"]), days, sub.get("tz_name") or DEFAULT_TZ_NAME, sub.get("units") or "standard")
-        embed = self._outlook_embed(sub, outlook)
-        embed.description = "**Test delivery** — this does not affect the next scheduled run."
+        if sub.get("report_type", "forecast") == "briefing":
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                try:
+                    air = await _fetch_air_quality(session, float(sub["latitude"]), float(sub["longitude"]), sub.get("tz_name") or DEFAULT_TZ_NAME)
+                except Exception:
+                    air = None
+            embed = self._briefing_embed(sub, outlook, air)
+            embed.description = "**Test delivery** — this does not affect the next scheduled run.\n\n" + (embed.description or "")
+        else:
+            embed = self._outlook_embed(sub, outlook)
+            embed.description = "**Test delivery** — this does not affect the next scheduled run."
         if sub.get("destination_type") == "channel":
             channel = self.bot.get_channel(int(sub["channel_id"])) or await self.bot.fetch_channel(int(sub["channel_id"]))
             await channel.send(embed=embed)
@@ -794,17 +944,19 @@ class Weather(commands.Cog):
     @app_commands.command(name="weather_subscribe", description="Open the guided forecast subscription setup wizard.")
     async def weather_subscribe(self, inter: discord.Interaction):
         state = SubscriptionDraft(user_id=inter.user.id)
-        embed = wizard_embed("Where should this report go?", "Choose a personal DM or a server channel.", state)
-        await inter.response.send_message(embed=embed, view=DestinationView(self, state), ephemeral=True)
+        embed = wizard_embed("What should be delivered?", "Choose a traditional forecast outlook or a plain-language weather briefing.", state)
+        await inter.response.send_message(embed=embed, view=ReportTypeView(self, state), ephemeral=True)
 
     @app_commands.command(name="weather_subscribe_advanced", description="Create a subscription using advanced command options.")
     @app_commands.describe(time="Delivery time, such as 7:00 AM", cadence="daily or weekly", location="City, place, postal code, or saved default", destination="dm or channel", channel="Required for channel delivery", weekly_days="Number of forecast days for weekly reports", metric="max_wind, max_temp, min_temp, rain_chance, precipitation, or uv", operator=">, >=, <, or <=", threshold="Only send when this condition matches")
-    async def weather_subscribe_advanced(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
+    async def weather_subscribe_advanced(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, report_type: str="forecast", metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
         await inter.response.defer(ephemeral=True)
         try:
             cadence=cadence.lower(); destination=destination.lower()
             if cadence not in {"daily","weekly"}: raise ValueError("Cadence must be daily or weekly.")
             if destination not in {"dm","channel"}: raise ValueError("Destination must be dm or channel.")
+            report_type=report_type.lower()
+            if report_type not in {"forecast","briefing"}: raise ValueError("Report type must be forecast or briefing.")
             if destination=="channel":
                 if not inter.guild or not channel: raise ValueError("Choose a server channel.")
                 if not inter.user.guild_permissions.manage_guild: raise ValueError("Manage Server permission is required.")
@@ -815,7 +967,7 @@ class Weather(commands.Cog):
             hh,mi=_parse_time(time)
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session: loc=await self._resolve_location(session,inter.user.id,location)
             tz_name=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id); first=_next_local_run(datetime.now(_tzinfo_from_name(tz_name)),hh,mi,cadence)
-            sub={"user_id":inter.user.id,"zip":"","cadence":cadence,"hh":hh,"mi":mi,"weekly_days":weekly_days,"tz_name":tz_name,"units":_get_user_units(self.store,inter.user.id),"next_run_utc":first.astimezone(timezone.utc).isoformat(),"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"destination_type":destination,"guild_id":inter.guild.id if destination=="channel" else None,"channel_id":channel.id if channel else None,"created_by":inter.user.id,"condition_metric":metric,"condition_operator":operator,"condition_value":threshold,"condition_unit":_get_user_units(self.store,inter.user.id),"enabled":1}
+            sub={"user_id":inter.user.id,"zip":"","cadence":cadence,"hh":hh,"mi":mi,"weekly_days":weekly_days,"tz_name":tz_name,"units":_get_user_units(self.store,inter.user.id),"next_run_utc":first.astimezone(timezone.utc).isoformat(),"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"destination_type":destination,"guild_id":inter.guild.id if destination=="channel" else None,"channel_id":channel.id if channel else None,"created_by":inter.user.id,"condition_metric":metric,"condition_operator":operator,"condition_value":threshold,"condition_unit":_get_user_units(self.store,inter.user.id),"enabled":1,"report_type":report_type}
             sid=self.store.add_weather_sub(sub); condition=f" only when `{metric} {operator} {threshold}`" if metric else ""
             await inter.followup.send(f"✅ Subscription **#{sid}** created for **{loc['display_name']}**, delivered to **{channel.mention if channel else 'DM'}**{condition}. Next evaluation: {first.strftime('%Y-%m-%d %I:%M %p %Z')}",ephemeral=True)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
@@ -835,7 +987,7 @@ class Weather(commands.Cog):
             status = "active" if row.get("enabled", 1) else "paused"
             result = f"\nLast evaluation: {row['last_result']}" if row.get("last_result") else ""
             lines.append(
-                f"**#{row['id']}** · {status} · {row['cadence']} at {row['hh']:02d}:{row['mi']:02d}\n"
+                f"**#{row['id']}** · {status} · {row.get('report_type','forecast')} · {row['cadence']} at {row['hh']:02d}:{row['mi']:02d}\n"
                 f"{row.get('location_name') or row.get('zip')} → {dest}{cond}{result}"
             )
         embed = discord.Embed(
@@ -855,6 +1007,17 @@ class Weather(commands.Cog):
         admin=bool(inter.guild and inter.user.guild_permissions.manage_guild)
         ok=self.store.remove_weather_sub(sub_id,inter.user.id,inter.guild.id if inter.guild else None,admin)
         await inter.response.send_message("Removed." if ok else "Could not remove that subscription.",ephemeral=True)
+
+    def _briefing_embed(self, sub, outlook, air=None):
+        name = sub.get("location_name") or sub.get("zip") or "Saved location"
+        emb = discord.Embed(
+            title=f"🌤️ Weather Briefing — {name}",
+            description=_weather_briefing(name, outlook, sub.get("units") or "standard", air),
+            colour=discord.Colour.blurple(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        emb.set_footer(text=f"Scheduled in {sub.get('tz_name') or DEFAULT_TZ_NAME} • Units: {sub.get('units') or 'standard'}")
+        return emb
 
     def _condition_matches(self, sub, outlook):
         metric=sub.get("condition_metric")
@@ -899,7 +1062,12 @@ class Weather(commands.Cog):
                     outlook=await _fetch_outlook(session,float(lat),float(lon),days,s.get("tz_name") or DEFAULT_TZ_NAME,s.get("units") or "standard")
                     matched,result=self._condition_matches(s,outlook)
                     if matched:
-                        emb=self._outlook_embed(s,outlook)
+                        if s.get("report_type", "forecast") == "briefing":
+                            try: air=await _fetch_air_quality(session,float(lat),float(lon),s.get("tz_name") or DEFAULT_TZ_NAME)
+                            except Exception: air=None
+                            emb=self._briefing_embed(s,outlook,air)
+                        else:
+                            emb=self._outlook_embed(s,outlook)
                         if s.get("destination_type")=="channel":
                             ch=self.bot.get_channel(int(s["channel_id"])) or await self.bot.fetch_channel(int(s["channel_id"])); await ch.send(embed=emb)
                         else:
@@ -980,8 +1148,17 @@ class Weather(commands.Cog):
         if not inter.guild or not inter.user.guild_permissions.manage_guild:return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
         ok=self.store.remove_server_weather_post(post_id,inter.guild.id); await inter.response.send_message("✅ Deleted." if ok else "Post not found in this server.",ephemeral=True)
 
-    @app_commands.command(name="weather_roles_setup", description="Configure opt-in weather alert roles for this server (US alerts).")
-    async def weather_roles_setup(self, inter: discord.Interaction, channel: discord.TextChannel, location: str, storm_role: Optional[discord.Role]=None, winter_role: Optional[discord.Role]=None, tornado_role: Optional[discord.Role]=None, flood_role: Optional[discord.Role]=None, heat_role: Optional[discord.Role]=None, min_severity: str="moderate"):
+    @app_commands.command(name="weather_roles_setup", description="Open the guided weather-role setup wizard (US alerts).")
+    async def weather_roles_setup(self, inter: discord.Interaction):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:
+            return await inter.response.send_message("You need **Manage Server** to configure weather roles.", ephemeral=True)
+        await inter.response.send_message(
+            embed=discord.Embed(title="🚨 Weather Role Setup", description="This wizard will choose an alert channel, confirm a US location, select a minimum severity, and automatically create five opt-in roles if needed.", colour=discord.Colour.blurple()),
+            view=WeatherRoleChannelView(self, inter.user.id), ephemeral=True,
+        )
+
+    @app_commands.command(name="weather_roles_setup_advanced", description="Advanced: configure existing opt-in weather alert roles (US alerts).")
+    async def weather_roles_setup_advanced(self, inter: discord.Interaction, channel: discord.TextChannel, location: str, storm_role: Optional[discord.Role]=None, winter_role: Optional[discord.Role]=None, tornado_role: Optional[discord.Role]=None, flood_role: Optional[discord.Role]=None, heat_role: Optional[discord.Role]=None, min_severity: str="moderate"):
         if not inter.guild or not inter.user.guild_permissions.manage_guild:return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
         await inter.response.defer(ephemeral=True)
         try:

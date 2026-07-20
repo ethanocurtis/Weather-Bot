@@ -215,3 +215,12 @@ Use `/weather_roles_setup` to connect optional server roles to US National Weath
 - `heat`
 
 Members opt in and out with `/weather_role_join` and `/weather_role_leave`. The bot needs **Manage Roles**, and its highest role must be above every alert role it manages. Server role alerts currently require a US location because they use the National Weather Service alert feed.
+
+
+## v2.1.1 usability additions
+
+- `/weather_roles_setup` launches a guided setup and automatically creates recommended roles.
+- `/weather_roles_setup_advanced` remains available for servers that already have custom roles.
+- `/weather_subscribe` now starts by choosing **Forecast Outlook** or **Weather Briefing**.
+- Briefing subscriptions include a plain-language forecast plus air-quality and available pollen context.
+- `/help` now documents sticky dashboards, server posts, weather roles, air and pollen, briefings, alerts, feedback, and owner analytics.
