@@ -224,3 +224,17 @@ Members opt in and out with `/weather_role_join` and `/weather_role_leave`. The 
 - `/weather_subscribe` now starts by choosing **Forecast Outlook** or **Weather Briefing**.
 - Briefing subscriptions include a plain-language forecast plus air-quality and available pollen context.
 - `/help` now documents sticky dashboards, server posts, weather roles, air and pollen, briefings, alerts, feedback, and owner analytics.
+
+## Unified dashboard (v2.2)
+
+The primary command layout is now:
+
+- `/weather` — quick current weather lookup
+- `/brief` — quick plain-language weather, air-quality, and pollen briefing
+- `/dashboard` — personal and server weather management
+- `/roles` — join or leave configured server weather roles
+- `/help` — feature documentation
+
+The dashboard builds on the existing subscription and weather-role setup wizards instead of introducing duplicate setup flows. Existing configuration commands remain available as compatibility shortcuts.
+
+> Discord slash commands cannot simultaneously provide an executable `/weather` command and a `/weather dashboard` subcommand. The bot keeps `/weather` for quick access and uses `/dashboard` for management.

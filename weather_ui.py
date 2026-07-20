@@ -7,12 +7,12 @@ import discord
 
 
 HELP_PAGES = {
-    "weather": ("🌤️ Weather & Forecasts", "`/weather` current conditions · `/hourly` hourly forecast · `/moon` moon phase · `/weather_briefing` plain-language weather, air, and pollen summary."),
+    "weather": ("🌤️ Weather & Forecasts", "`/weather` gives quick current conditions, `/brief` gives a quick plain-language briefing, `/hourly` gives an hourly forecast, and `/moon` shows the moon phase."),
     "air": ("🌬️ Air & Pollen", "Use `/air_quality` for US AQI, particulate levels, and available pollen forecasts. Pollen availability varies by region and season."),
     "locations": ("📍 Locations", "`/location_set` saves a worldwide city, place, or postal code. `/locations` lists saved locations. `/weather_set_zip` remains available for legacy US ZIP setup."),
-    "subscriptions": ("🔔 Personal & Channel Subscriptions", "Use `/weather_subscribe` for the guided wizard. Choose either a forecast outlook or a weather briefing, then destination, location, schedule, and optional threshold. `/weather_subscriptions` manages existing subscriptions; `/weather_subscribe_advanced` is the power-user fallback."),
+    "subscriptions": ("🔔 Personal & Channel Subscriptions", "Use `/dashboard` as the main control center, or `/weather_subscribe` to jump directly into the guided wizard. Choose either a forecast outlook or a weather briefing, then destination, location, schedule, and optional threshold. `/weather_subscriptions` manages existing subscriptions; `/weather_subscribe_advanced` is the power-user fallback."),
     "server_posts": ("📅 Scheduled Server Posts", "Admins can create dedicated daily or weekly channel briefings with `/server_weather_post_create`, list them with `/server_weather_posts`, and remove them with `/server_weather_post_delete`."),
-    "roles": ("🚨 Weather Roles", "Admins use `/weather_roles_setup` for the guided US alert-role wizard. Members then opt in with `/weather_role_join` and opt out with `/weather_role_leave`. The bot needs Manage Roles and must sit above the alert roles."),
+    "roles": ("🚨 Weather Roles", "Use `/roles` to join or leave configured weather roles. Admins can launch the existing setup wizard from `/dashboard` or use `/weather_roles_setup`. The bot needs Manage Roles and must sit above the alert roles."),
     "sticky": ("📌 Sticky Dashboard", "Admins can create an automatically refreshed weather message with `/sticky_weather_create`, list dashboards with `/sticky_weather_list`, and delete one with `/sticky_weather_delete`."),
     "alerts": ("⚠️ Personal Alerts", "Use `/wx_alerts mode:on` for active US National Weather Service alerts by DM. NWS alerts require a saved US location."),
     "settings": ("⚙️ Settings", "`/units` changes standard or metric units, `/timezone` controls scheduling, and `/settings` reviews your preferences."),
@@ -444,3 +444,161 @@ class SubscriptionManageView(OwnedView):
             await interaction.response.send_message("✅ Subscription deleted." if ok else "Could not delete that subscription.", ephemeral=True)
         except Exception as exc:
             await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+
+
+def dashboard_home_embed(cog, interaction: discord.Interaction) -> discord.Embed:
+    locations = cog.store.list_locations(interaction.user.id)
+    personal_subs = cog.store.list_weather_subs(interaction.user.id)
+    default = next((r for r in locations if r.get("is_default")), locations[0] if locations else None)
+    embed = discord.Embed(
+        title="🌦️ Weather Dashboard",
+        description="Use this dashboard to manage weather features. Quick lookups remain available through `/weather` and `/brief`.",
+        colour=discord.Colour.blurple(),
+    )
+    embed.add_field(
+        name="Personal weather",
+        value=(
+            f"**Default location:** {default.get('display_name') if default else 'Not set'}\n"
+            f"**Saved locations:** {len(locations)}\n"
+            f"**Subscriptions:** {len(personal_subs)}"
+        ),
+        inline=False,
+    )
+    if interaction.guild:
+        guild_id = interaction.guild.id
+        posts = cog.store.list_server_weather_posts(guild_id=guild_id)
+        sticky = cog.store.list_sticky_dashboards(guild_id=guild_id)
+        roles = cog.store.get_weather_role_config(guild_id)
+        embed.add_field(
+            name="Server weather",
+            value=(
+                f"**Scheduled posts:** {len(posts)}\n"
+                f"**Sticky dashboards:** {len(sticky)}\n"
+                f"**Weather roles:** {'Configured' if roles and roles.get('enabled', 1) else 'Not configured'}"
+            ),
+            inline=False,
+        )
+        if not interaction.user.guild_permissions.manage_guild:
+            embed.set_footer(text="Server configuration buttons require Manage Server. /roles is available to all members.")
+    else:
+        embed.set_footer(text="Open the dashboard inside a server to see server weather controls.")
+    return embed
+
+
+class WeatherDashboardView(OwnedView):
+    """Unified launcher that reuses the bot's established setup and management views."""
+
+    def __init__(self, cog, owner_id: int):
+        super().__init__(owner_id, timeout=600)
+        self.cog = cog
+
+    @discord.ui.button(label="New Subscription", emoji="➕", style=discord.ButtonStyle.success, row=0)
+    async def new_subscription(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        state = SubscriptionDraft(user_id=interaction.user.id)
+        await interaction.response.edit_message(
+            embed=wizard_embed("What should be delivered?", "Choose a forecast outlook or a plain-language weather briefing.", state),
+            view=ReportTypeView(self.cog, state),
+        )
+
+    @discord.ui.button(label="Manage Subscriptions", emoji="🔔", style=discord.ButtonStyle.primary, row=0)
+    async def manage_subscriptions(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        rows = self.cog.dashboard_subscription_rows(interaction)
+        if not rows:
+            state = SubscriptionDraft(user_id=interaction.user.id)
+            return await interaction.response.edit_message(
+                embed=wizard_embed("What should be delivered?", "You do not have subscriptions yet. Start by choosing a report type.", state),
+                view=ReportTypeView(self.cog, state),
+            )
+        await interaction.response.edit_message(
+            embed=self.cog.subscription_dashboard_embed(rows),
+            view=SubscriptionManageView(self.cog, interaction.user.id, rows, interaction.guild.id if interaction.guild else None),
+        )
+
+    @discord.ui.button(label="Locations & Preferences", emoji="📍", style=discord.ButtonStyle.secondary, row=0)
+    async def preferences(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        rows = self.cog.store.list_locations(interaction.user.id)
+        default = next((r for r in rows if r.get("is_default")), rows[0] if rows else None)
+        embed = discord.Embed(title="📍 Locations & Preferences", colour=discord.Colour.blurple())
+        embed.description = (
+            f"**Default location:** {default.get('display_name') if default else 'Not set'}\n"
+            f"**Units:** {self.cog.get_user_units(interaction.user.id)}\n"
+            f"**Timezone:** `{self.cog.get_user_timezone(interaction.user.id)}`\n\n"
+            "Location editing still uses `/location_set`; unit and timezone changes use `/units` and `/timezone`. "
+            "These controls will move into this page as the dashboard is expanded."
+        )
+        await interaction.response.edit_message(embed=embed, view=DashboardBackView(self.cog, interaction.user.id))
+
+    @discord.ui.button(label="Weather Roles", emoji="🚨", style=discord.ButtonStyle.secondary, row=1)
+    async def roles(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog.open_roles_panel(interaction, edit=True)
+
+    @discord.ui.button(label="Server Weather", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def server_weather(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("Open the dashboard inside a server to manage server weather.", ephemeral=True)
+        if not interaction.user.guild_permissions.manage_guild:
+            return await interaction.response.send_message("You need **Manage Server** for server weather configuration.", ephemeral=True)
+        await interaction.response.edit_message(embed=self.cog.server_dashboard_embed(interaction.guild), view=ServerWeatherDashboardView(self.cog, interaction.user.id))
+
+    @discord.ui.button(label="Help", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
+    async def help(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="🌦️ Weather Bot Help", description="Choose a topic below.", colour=discord.Colour.blurple()),
+            view=HelpView(self.cog, interaction.user.id),
+        )
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.primary, row=2)
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(embed=dashboard_home_embed(self.cog, interaction), view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, row=2)
+    async def close(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(content="Weather dashboard closed.", embed=None, view=None)
+
+
+class DashboardBackView(OwnedView):
+    def __init__(self, cog, owner_id: int):
+        super().__init__(owner_id, timeout=600)
+        self.cog = cog
+
+    @discord.ui.button(label="Dashboard Home", emoji="🏠", style=discord.ButtonStyle.primary)
+    async def home(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(embed=dashboard_home_embed(self.cog, interaction), view=WeatherDashboardView(self.cog, interaction.user.id))
+
+
+class ServerWeatherDashboardView(OwnedView):
+    def __init__(self, cog, owner_id: int):
+        super().__init__(owner_id, timeout=600)
+        self.cog = cog
+
+    @discord.ui.button(label="Role Setup Wizard", emoji="🚨", style=discord.ButtonStyle.success, row=0)
+    async def role_setup(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog.open_weather_role_setup(interaction, edit=True)
+
+    @discord.ui.button(label="Scheduled Posts", emoji="📅", style=discord.ButtonStyle.primary, row=0)
+    async def posts(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        rows = self.cog.store.list_server_weather_posts(guild_id=interaction.guild.id)
+        text = "\n".join(
+            f"**#{r['id']}** · <#{r['channel_id']}> · {r['cadence']} at {r['hh']:02d}:{r['mi']:02d} · {'active' if r['enabled'] else 'paused'}"
+            for r in rows
+        ) or "No scheduled server posts. Use `/server_weather_post_create` to create one while its dashboard wizard is being consolidated."
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="📅 Scheduled Server Posts", description=text, colour=discord.Colour.blurple()),
+            view=DashboardBackView(self.cog, interaction.user.id),
+        )
+
+    @discord.ui.button(label="Sticky Dashboards", emoji="📌", style=discord.ButtonStyle.secondary, row=0)
+    async def sticky(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        rows = self.cog.store.list_sticky_dashboards(guild_id=interaction.guild.id)
+        text = "\n".join(
+            f"**#{r['id']}** · <#{r['channel_id']}> · every {r['refresh_minutes']} minutes · {'active' if r['enabled'] else 'paused'}"
+            for r in rows
+        ) or "No sticky dashboards. Use `/sticky_weather_create` to create one while its dashboard wizard is being consolidated."
+        await interaction.response.edit_message(
+            embed=discord.Embed(title="📌 Sticky Weather Dashboards", description=text, colour=discord.Colour.blurple()),
+            view=DashboardBackView(self.cog, interaction.user.id),
+        )
+
+    @discord.ui.button(label="Dashboard Home", emoji="🏠", style=discord.ButtonStyle.primary, row=1)
+    async def home(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(embed=dashboard_home_embed(self.cog, interaction), view=WeatherDashboardView(self.cog, interaction.user.id))

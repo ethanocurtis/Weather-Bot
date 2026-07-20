@@ -14,7 +14,7 @@ import discord
 from discord.ext import tasks, commands
 from discord import app_commands
 from location_service import search_locations
-from weather_ui import HelpView, SubscriptionDraft, ReportTypeView, SubscriptionManageView, wizard_embed
+from weather_ui import (HelpView, SubscriptionDraft, ReportTypeView, SubscriptionManageView, wizard_embed, WeatherDashboardView, dashboard_home_embed)
 
 # ---- Constants & styling helpers ----
 DEFAULT_TZ_NAME = "America/Chicago"
@@ -25,7 +25,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.1.1"
+BOT_VERSION = "2.2.0"
 
 
 
@@ -654,6 +654,55 @@ class WeatherRoleSeverityView(discord.ui.View):
         await self.finish(interaction, "minor")
 
 
+class WeatherRoleMemberView(discord.ui.View):
+    CATEGORIES = (
+        ("storm", "Storm", "🌩"),
+        ("winter", "Winter", "🌨"),
+        ("tornado", "Tornado", "🌪"),
+        ("flood", "Flood", "🌊"),
+        ("heat", "Heat", "🔥"),
+    )
+
+    def __init__(self, cog, owner_id: int, guild: discord.Guild):
+        super().__init__(timeout=600)
+        self.cog, self.owner_id, self.guild = cog, int(owner_id), guild
+        cfg = cog.store.get_weather_role_config(guild.id) or {}
+        for category, label, emoji in self.CATEGORIES:
+            role_id = cfg.get(f"{category}_role_id")
+            role = guild.get_role(int(role_id)) if role_id else None
+            if role:
+                self.add_item(WeatherRoleToggleButton(category, label, emoji, role))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This role menu belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+
+class WeatherRoleToggleButton(discord.ui.Button):
+    def __init__(self, category: str, label: str, emoji: str, role: discord.Role):
+        self.category, self.role = category, role
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        joined = self.role in getattr(member, "roles", [])
+        try:
+            if joined:
+                await member.remove_roles(self.role, reason="Weather dashboard role opt-out")
+            else:
+                await member.add_roles(self.role, reason="Weather dashboard role opt-in")
+            await interaction.response.send_message(
+                f"✅ {'Removed' if joined else 'Added'} {self.role.mention}.", ephemeral=True
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I cannot manage that role. An admin needs to place my bot role above it and grant Manage Roles.",
+                ephemeral=True,
+            )
+
+
 class Weather(commands.Cog):
     """Weather, locations, subscriptions, alerts, and feedback tracking."""
     def __init__(self, bot: commands.Bot, store=None):
@@ -813,6 +862,87 @@ class Weather(commands.Cog):
             return await inter.followup.send("Please wait a minute before submitting another request." if str(e)=="cooldown" else "Feedback routing is not configured correctly.", ephemeral=True)
         except ValueError: return await inter.followup.send("Please include a message.", ephemeral=True)
         await inter.followup.send(f"✅ Submitted as **#{rid}**. You’ll be notified when its status changes.", ephemeral=True)
+
+    def get_user_units(self, user_id: int) -> str:
+        return _get_user_units(self.store, user_id)
+
+    def get_user_timezone(self, user_id: int) -> str:
+        return _get_user_tz_name(self.store, user_id)
+
+    def dashboard_subscription_rows(self, inter: discord.Interaction) -> List[Dict[str, Any]]:
+        rows = self.store.list_weather_subs(inter.user.id)
+        if inter.guild and inter.user.guild_permissions.manage_guild:
+            known = {r["id"] for r in rows}
+            rows += [r for r in self.store.list_weather_subs(guild_id=inter.guild.id) if r["id"] not in known]
+        return rows
+
+    def subscription_dashboard_embed(self, rows: List[Dict[str, Any]]) -> discord.Embed:
+        lines = []
+        for row in rows[:25]:
+            dest = f"<#{row['channel_id']}>" if row.get("destination_type") == "channel" else "DM"
+            cond = f" · if {row['condition_metric']} {row['condition_operator']} {row['condition_value']}" if row.get("condition_metric") else " · always"
+            status = "active" if row.get("enabled", 1) else "paused"
+            lines.append(
+                f"**#{row['id']}** · {status} · {row.get('report_type','forecast')} · {row['cadence']} at {row['hh']:02d}:{row['mi']:02d}\n"
+                f"{row.get('location_name') or row.get('zip')} → {dest}{cond}"
+            )
+        embed = discord.Embed(title="🔔 Subscription Dashboard", description="\n\n".join(lines), colour=discord.Colour.blurple())
+        embed.set_footer(text="Choose a subscription below to test, pause/resume, or delete it.")
+        return embed
+
+    def server_dashboard_embed(self, guild: discord.Guild) -> discord.Embed:
+        posts = self.store.list_server_weather_posts(guild_id=guild.id)
+        sticky = self.store.list_sticky_dashboards(guild_id=guild.id)
+        roles = self.store.get_weather_role_config(guild.id)
+        embed = discord.Embed(title=f"🏠 Server Weather — {guild.name}", description="Manage server-wide weather delivery and alerts.", colour=discord.Colour.blurple())
+        embed.add_field(name="Scheduled posts", value=str(len(posts)), inline=True)
+        embed.add_field(name="Sticky dashboards", value=str(len(sticky)), inline=True)
+        embed.add_field(name="Weather roles", value="Configured" if roles and roles.get("enabled", 1) else "Not configured", inline=True)
+        return embed
+
+    async def open_weather_role_setup(self, inter: discord.Interaction, *, edit: bool = False):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:
+            return await inter.response.send_message("You need **Manage Server** to configure weather roles.", ephemeral=True)
+        embed = discord.Embed(
+            title="🚨 Weather Role Setup",
+            description="This existing wizard chooses an alert channel, confirms a US location, selects a minimum severity, and creates the opt-in roles.",
+            colour=discord.Colour.blurple(),
+        )
+        view = WeatherRoleChannelView(self, inter.user.id)
+        if edit:
+            await inter.response.edit_message(embed=embed, view=view)
+        else:
+            await inter.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    async def open_roles_panel(self, inter: discord.Interaction, *, edit: bool = False):
+        if not inter.guild:
+            return await inter.response.send_message("Use `/roles` inside a server.", ephemeral=True)
+        cfg = self.store.get_weather_role_config(inter.guild.id)
+        if not cfg or not cfg.get("enabled", 1):
+            text = "Weather roles are not configured in this server."
+            if inter.user.guild_permissions.manage_guild:
+                text += " Open `/dashboard` and choose **Server Weather → Role Setup Wizard**."
+            return await inter.response.send_message(text, ephemeral=True)
+        configured = []
+        for category, label, emoji in WeatherRoleMemberView.CATEGORIES:
+            rid = cfg.get(f"{category}_role_id")
+            role = inter.guild.get_role(int(rid)) if rid else None
+            if role:
+                configured.append(f"{emoji} {role.mention} — {'joined' if role in inter.user.roles else 'not joined'}")
+        embed = discord.Embed(title="🚨 Weather Notification Roles", description="Click a button to join or leave that role.\n\n" + "\n".join(configured), colour=discord.Colour.blurple())
+        view = WeatherRoleMemberView(self, inter.user.id, inter.guild)
+        if edit:
+            await inter.response.edit_message(embed=embed, view=view)
+        else:
+            await inter.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @app_commands.command(name="dashboard", description="Open the unified Weather Bot dashboard.")
+    async def dashboard_cmd(self, inter: discord.Interaction):
+        await inter.response.send_message(embed=dashboard_home_embed(self, inter), view=WeatherDashboardView(self, inter.user.id), ephemeral=True)
+
+    @app_commands.command(name="roles", description="Join or leave this server's weather notification roles.")
+    async def roles_cmd(self, inter: discord.Interaction):
+        await self.open_roles_panel(inter)
 
     @app_commands.command(name="help", description="Open the interactive Weather Bot help menu.")
     async def help_cmd(self, inter: discord.Interaction):
@@ -1106,18 +1236,37 @@ class Weather(commands.Cog):
             self.store.record_event("air_quality_lookup",inter.user.id,inter.guild.id if inter.guild else None)
         except Exception as exc: await inter.followup.send(f"⚠️ Could not load air quality: {exc}")
 
-    @app_commands.command(name="weather_briefing", description="Get a plain-language weather, air-quality, and pollen briefing.")
-    async def weather_briefing(self, inter: discord.Interaction, location: Optional[str]=None):
+    async def _send_briefing_command(self, inter: discord.Interaction, location: Optional[str] = None):
         await inter.response.defer()
         try:
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-                loc=await self._resolve_location(session,inter.user.id,location); units=_get_user_units(self.store,inter.user.id); tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id)
-                outlook=await _fetch_outlook(session,float(loc["latitude"]),float(loc["longitude"]),2,tz,units)
-                try: air=await _fetch_air_quality(session,float(loc["latitude"]),float(loc["longitude"]),tz)
-                except Exception: air=None
-            emb=discord.Embed(title=f"🌤️ Weather Briefing — {loc['display_name']}",description=_weather_briefing(loc['display_name'],outlook,units,air),colour=wx_color_from_temp_f(outlook[0][5] if units=='standard' else (outlook[0][5]*9/5+32 if outlook[0][5] is not None else None)),timestamp=datetime.now(timezone.utc))
-            await inter.followup.send(embed=emb); self.store.record_event("weather_briefing",inter.user.id,inter.guild.id if inter.guild else None)
-        except Exception as exc: await inter.followup.send(f"⚠️ Could not create the briefing: {exc}")
+                loc = await self._resolve_location(session, inter.user.id, location)
+                units = _get_user_units(self.store, inter.user.id)
+                tz = loc.get("timezone") or _get_user_tz_name(self.store, inter.user.id)
+                outlook = await _fetch_outlook(session, float(loc["latitude"]), float(loc["longitude"]), 2, tz, units)
+                try:
+                    air = await _fetch_air_quality(session, float(loc["latitude"]), float(loc["longitude"]), tz)
+                except Exception:
+                    air = None
+            temp_f = outlook[0][5] if units == "standard" else (outlook[0][5] * 9 / 5 + 32 if outlook[0][5] is not None else None)
+            emb = discord.Embed(
+                title=f"🌤️ Weather Briefing — {loc['display_name']}",
+                description=_weather_briefing(loc["display_name"], outlook, units, air),
+                colour=wx_color_from_temp_f(temp_f),
+                timestamp=datetime.now(timezone.utc),
+            )
+            await inter.followup.send(embed=emb)
+            self.store.record_event("weather_briefing", inter.user.id, inter.guild.id if inter.guild else None)
+        except Exception as exc:
+            await inter.followup.send(f"⚠️ Could not create the briefing: {exc}")
+
+    @app_commands.command(name="brief", description="Quick plain-language weather, air-quality, and pollen briefing.")
+    async def brief_cmd(self, inter: discord.Interaction, location: Optional[str] = None):
+        await self._send_briefing_command(inter, location)
+
+    @app_commands.command(name="weather_briefing", description="Legacy alias for /brief.")
+    async def weather_briefing(self, inter: discord.Interaction, location: Optional[str] = None):
+        await self._send_briefing_command(inter, location)
 
     @app_commands.command(name="server_weather_post_create", description="Create a daily or weekly server weather briefing.")
     @app_commands.describe(channel="Destination channel", cadence="daily or weekly", time="Local time such as 7:00am", location="City, place, postal code, or saved default", weekly_day="0=Monday through 6=Sunday")
@@ -1150,12 +1299,7 @@ class Weather(commands.Cog):
 
     @app_commands.command(name="weather_roles_setup", description="Open the guided weather-role setup wizard (US alerts).")
     async def weather_roles_setup(self, inter: discord.Interaction):
-        if not inter.guild or not inter.user.guild_permissions.manage_guild:
-            return await inter.response.send_message("You need **Manage Server** to configure weather roles.", ephemeral=True)
-        await inter.response.send_message(
-            embed=discord.Embed(title="🚨 Weather Role Setup", description="This wizard will choose an alert channel, confirm a US location, select a minimum severity, and automatically create five opt-in roles if needed.", colour=discord.Colour.blurple()),
-            view=WeatherRoleChannelView(self, inter.user.id), ephemeral=True,
-        )
+        await self.open_weather_role_setup(inter)
 
     @app_commands.command(name="weather_roles_setup_advanced", description="Advanced: configure existing opt-in weather alert roles (US alerts).")
     async def weather_roles_setup_advanced(self, inter: discord.Interaction, channel: discord.TextChannel, location: str, storm_role: Optional[discord.Role]=None, winter_role: Optional[discord.Role]=None, tornado_role: Optional[discord.Role]=None, flood_role: Optional[discord.Role]=None, heat_role: Optional[discord.Role]=None, min_severity: str="moderate"):
