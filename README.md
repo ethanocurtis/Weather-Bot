@@ -1,4 +1,4 @@
-# Weather Bot
+# Weather Bot v2.0.1
 
 A Dockerized Discord weather bot with international location search, personal and server forecasts, conditional reports, US NWS alerts, and trackable user feedback.
 
@@ -12,6 +12,35 @@ A Dockerized Discord weather bot with international location search, personal an
 - Persistent feature, bug, and feedback requests with IDs and status notifications
 - US National Weather Service alert DMs
 - SQLite storage with automatic migration of the previous ZIP/DM subscription schema
+
+## Version 2.0.1
+
+### Owner analytics
+
+`/owner_analytics` opens an owner-only control panel showing:
+
+- Current server count
+- Known users and saved locations
+- Active personal and server subscriptions
+- Active sticky dashboards
+- Weather lookups, scheduled reports, threshold skips, and scheduler errors recorded today
+- Pending feature requests and bug reports
+
+Set `BOT_OWNER_ID` in `.env` to restrict this command. Event-based analytics begin accumulating after the 2.0.1 upgrade; aggregate totals are available immediately.
+
+### Sticky weather dashboards
+
+Server administrators can create a single live weather message that updates in place instead of posting repeated messages:
+
+```text
+/sticky_weather_create channel:#weather location:Auckland, New Zealand refresh_minutes:15
+/sticky_weather_list
+/sticky_weather_delete dashboard_id:1
+```
+
+The dashboard includes **Hourly**, **7-Day**, and **Refresh** buttons. The automatic refresh interval can be set from 5 to 60 minutes. Creating or deleting one requires **Manage Server**. The bot needs **View Channel**, **Send Messages**, **Embed Links**, and **Read Message History** in the target channel.
+
+Existing databases migrate automatically by adding the dashboard and analytics tables. Back up `data/wxbot.sqlite3` before upgrading.
 
 ## Quick start
 

@@ -101,6 +101,38 @@ class WxStore:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback_requests(user_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback_requests(status)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sticky_weather_dashboards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                message_id INTEGER,
+                created_by INTEGER NOT NULL,
+                location_name TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                country_code TEXT,
+                timezone TEXT NOT NULL,
+                units TEXT NOT NULL DEFAULT 'standard',
+                refresh_minutes INTEGER NOT NULL DEFAULT 15,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_refresh_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sticky_guild ON sticky_weather_dashboards(guild_id)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sticky_message ON sticky_weather_dashboards(message_id) WHERE message_id IS NOT NULL")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analytics_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                user_id INTEGER,
+                guild_id INTEGER,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_analytics_type_time ON analytics_events(event_type, created_at)")
         self.db.commit()
 
     # Legacy ZIP compatibility
@@ -206,3 +238,65 @@ class WxStore:
     def close(self):
         try: self.db.close()
         except Exception: pass
+
+
+    # Sticky weather dashboards
+    def add_sticky_dashboard(self, data: Dict[str, Any]) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        fields = ["guild_id","channel_id","message_id","created_by","location_name","latitude","longitude","country_code","timezone","units","refresh_minutes","enabled","created_at"]
+        vals = [data.get(f) for f in fields]
+        vals[-1] = now
+        cur = self.db.execute(f"INSERT INTO sticky_weather_dashboards({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", vals)
+        self.db.commit()
+        return int(cur.lastrowid)
+
+    def update_sticky_dashboard(self, dashboard_id: int, **updates) -> None:
+        allowed = {"message_id","enabled","last_refresh_at","last_error","refresh_minutes"}
+        updates = {k:v for k,v in updates.items() if k in allowed}
+        if not updates:
+            return
+        self.db.execute(f"UPDATE sticky_weather_dashboards SET {','.join(f'{k}=?' for k in updates)} WHERE id=?", [*updates.values(), int(dashboard_id)])
+        self.db.commit()
+
+    def get_sticky_dashboard(self, dashboard_id: int = None, message_id: int = None) -> Optional[Dict[str, Any]]:
+        if dashboard_id is not None:
+            row = self.db.execute("SELECT * FROM sticky_weather_dashboards WHERE id=?", (int(dashboard_id),)).fetchone()
+        elif message_id is not None:
+            row = self.db.execute("SELECT * FROM sticky_weather_dashboards WHERE message_id=?", (int(message_id),)).fetchone()
+        else:
+            return None
+        return dict(row) if row else None
+
+    def list_sticky_dashboards(self, guild_id: Optional[int] = None, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        where, args = [], []
+        if guild_id is not None:
+            where.append("guild_id=?"); args.append(int(guild_id))
+        if enabled_only:
+            where.append("enabled=1")
+        sql = "SELECT * FROM sticky_weather_dashboards" + ((" WHERE " + " AND ".join(where)) if where else "") + " ORDER BY id"
+        return [dict(r) for r in self.db.execute(sql, args).fetchall()]
+
+    def remove_sticky_dashboard(self, dashboard_id: int, guild_id: int) -> bool:
+        cur = self.db.execute("DELETE FROM sticky_weather_dashboards WHERE id=? AND guild_id=?", (int(dashboard_id), int(guild_id)))
+        self.db.commit()
+        return cur.rowcount > 0
+
+    # Lightweight owner analytics
+    def record_event(self, event_type: str, user_id: Optional[int] = None, guild_id: Optional[int] = None) -> None:
+        self.db.execute("INSERT INTO analytics_events(event_type,user_id,guild_id,created_at) VALUES(?,?,?,?)", (str(event_type), user_id, guild_id, datetime.now(timezone.utc).isoformat()))
+        self.db.commit()
+
+    def analytics_summary(self) -> Dict[str, Any]:
+        today = datetime.now(timezone.utc).date().isoformat()
+        scalar = lambda sql, args=(): int(self.db.execute(sql, args).fetchone()[0] or 0)
+        events = {r[0]: int(r[1]) for r in self.db.execute("SELECT event_type,COUNT(*) FROM analytics_events WHERE created_at>=? GROUP BY event_type", (today,)).fetchall()}
+        return {
+            "saved_locations": scalar("SELECT COUNT(*) FROM weather_locations"),
+            "known_users": scalar("SELECT COUNT(DISTINCT user_id) FROM weather_locations") + scalar("SELECT COUNT(DISTINCT user_id) FROM weather_zips WHERE user_id NOT IN (SELECT user_id FROM weather_locations)"),
+            "active_subscriptions": scalar("SELECT COUNT(*) FROM weather_subs WHERE enabled=1"),
+            "server_subscriptions": scalar("SELECT COUNT(*) FROM weather_subs WHERE enabled=1 AND destination_type='channel'"),
+            "sticky_dashboards": scalar("SELECT COUNT(*) FROM sticky_weather_dashboards WHERE enabled=1"),
+            "pending_features": scalar("SELECT COUNT(*) FROM feedback_requests WHERE request_type='feature' AND status NOT IN ('completed','declined','duplicate','fixed')"),
+            "pending_bugs": scalar("SELECT COUNT(*) FROM feedback_requests WHERE request_type='bug' AND status NOT IN ('completed','declined','duplicate','fixed')"),
+            "events_today": events,
+        }

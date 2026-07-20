@@ -25,6 +25,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
+BOT_VERSION = "2.0.1"
 
 
 
@@ -347,17 +348,95 @@ class RequestStatusView(discord.ui.View):
         await self._set(interaction, "declined")
 
 
+class StickyWeatherView(discord.ui.View):
+    """Persistent controls attached to every sticky weather dashboard."""
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def _dashboard(self, interaction: discord.Interaction):
+        row = self.cog.store.get_sticky_dashboard(message_id=interaction.message.id)
+        if not row or not row.get("enabled", 1):
+            await interaction.response.send_message("This weather dashboard is no longer active.", ephemeral=True)
+            return None
+        return row
+
+    @discord.ui.button(label="Hourly", emoji="🕐", style=discord.ButtonStyle.primary, custom_id="wx:sticky:hourly")
+    async def hourly(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        row = await self._dashboard(interaction)
+        if not row: return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                rows = await _fetch_hourly(session, row["latitude"], row["longitude"], row["timezone"], row["units"], 12)
+            lines=[]
+            for ts,code,temp,pop,_prec,wind,wu,_pu,deg in rows:
+                icon,_=wx_icon_desc(code)
+                lines.append(f"**{datetime.fromisoformat(ts).strftime('%I %p')}** {icon} {round(temp)}{deg} · rain {pop or 0}% · wind {round(wind or 0)} {wu}")
+            await interaction.followup.send(embed=discord.Embed(title=f"Hourly — {row['location_name']}", description="\n".join(lines), colour=discord.Colour.blurple()), ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Could not load the hourly forecast: {exc}", ephemeral=True)
+
+    @discord.ui.button(label="7-Day", emoji="📅", style=discord.ButtonStyle.secondary, custom_id="wx:sticky:daily")
+    async def daily(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        row = await self._dashboard(interaction)
+        if not row: return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                outlook = await _fetch_outlook(session, row["latitude"], row["longitude"], 7, row["timezone"], row["units"])
+            sub={"cadence":"weekly","location_name":row["location_name"],"tz_name":row["timezone"],"units":row["units"]}
+            await interaction.followup.send(embed=self.cog._outlook_embed(sub, outlook), ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Could not load the 7-day forecast: {exc}", ephemeral=True)
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.success, custom_id="wx:sticky:refresh")
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        row = await self._dashboard(interaction)
+        if not row: return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await self.cog.refresh_sticky_dashboard(row, interaction.message)
+            await interaction.followup.send("✅ Dashboard refreshed.", ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ Refresh failed: {exc}", ephemeral=True)
+
+
+class OwnerAnalyticsView(discord.ui.View):
+    def __init__(self, cog, owner_id: int):
+        super().__init__(timeout=300)
+        self.cog, self.owner_id = cog, int(owner_id)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id or not self.cog._is_staff(interaction.user):
+            await interaction.response.send_message("This owner dashboard is private.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(embed=self.cog.owner_analytics_embed(), view=self)
+
+    @discord.ui.button(label="Pending Requests", emoji="💬", style=discord.ButtonStyle.secondary)
+    async def requests(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        rows = self.cog.store.db.execute("SELECT id,request_type,status,message FROM feedback_requests WHERE status NOT IN ('completed','declined','duplicate','fixed') ORDER BY created_at DESC LIMIT 15").fetchall()
+        text = "\n\n".join(f"**#{r[0]} · {str(r[1]).title()} · {str(r[2]).replace('_',' ').title()}**\n{str(r[3])[:160]}" for r in rows) or "No pending requests."
+        await interaction.response.send_message(embed=discord.Embed(title="Pending Requests", description=text, colour=discord.Colour.blurple()), ephemeral=True)
+
+
 class Weather(commands.Cog):
     """Weather, locations, subscriptions, alerts, and feedback tracking."""
     def __init__(self, bot: commands.Bot, store=None):
         self.bot = bot
         self.store = store or getattr(bot, "store", None)
         self._feedback_last = {}
+        self.bot.add_view(StickyWeatherView(self))
         self.weather_scheduler.start()
         self.wx_alerts_scheduler.start()
+        self.sticky_dashboard_scheduler.start()
 
     def cog_unload(self):
-        self.weather_scheduler.cancel(); self.wx_alerts_scheduler.cancel()
+        self.weather_scheduler.cancel(); self.wx_alerts_scheduler.cancel(); self.sticky_dashboard_scheduler.cancel()
 
     def _is_staff(self, user) -> bool:
         return bool(BOT_OWNER_ID and int(user.id) == BOT_OWNER_ID)
@@ -598,6 +677,7 @@ class Weather(commands.Cog):
                 tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id)
                 emb=await self._current_embed(session,loc,_get_user_units(self.store,inter.user.id),tz)
             await inter.followup.send(embed=emb)
+            self.store.record_event("weather_lookup", inter.user.id, inter.guild.id if inter.guild else None)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
 
     @app_commands.command(name="hourly", description="Hourly forecast for any location.")
@@ -736,12 +816,100 @@ class Weather(commands.Cog):
                             user=self.bot.get_user(int(s["user_id"])) or await self.bot.fetch_user(int(s["user_id"])); await user.send(embed=emb)
                     tz=_tzinfo_from_name(s.get("tz_name") or DEFAULT_TZ_NAME); nxt=datetime.now(tz).replace(hour=int(s["hh"]),minute=int(s["mi"]),second=0,microsecond=0)+timedelta(days=1 if s["cadence"]=="daily" else 7)
                     self.store.update_weather_sub(s["id"],nxt.astimezone(timezone.utc).isoformat(),failure_count=0,last_error=None,last_result=("sent: " if matched else "not sent: ")+result,last_sent_at=now.isoformat() if matched else s.get("last_sent_at"))
+                    self.store.record_event("scheduled_sent" if matched else "scheduled_skipped", s.get("user_id"), s.get("guild_id"))
                 except Exception as e:
                     failures=int(s.get("failure_count") or 0)+1; disable=failures>=5
                     self.store.update_weather_sub(s["id"],(now+timedelta(minutes=5)).isoformat(),failure_count=failures,last_error=str(e)[:300],last_result="delivery failed",enabled=0 if disable else 1)
+                    self.store.record_event("scheduler_error", s.get("user_id"), s.get("guild_id"))
 
     @weather_scheduler.before_loop
     async def before_weather(self): await self.bot.wait_until_ready()
+
+    def owner_analytics_embed(self) -> discord.Embed:
+        stats = self.store.analytics_summary(); today = stats["events_today"]
+        emb = discord.Embed(title="🌦️ Weather Bot Owner Analytics", description=f"Version **{BOT_VERSION}**", colour=discord.Colour.blurple(), timestamp=datetime.now(timezone.utc))
+        emb.add_field(name="Reach", value=f"Servers **{len(self.bot.guilds):,}**\nKnown users **{stats['known_users']:,}**\nSaved locations **{stats['saved_locations']:,}**", inline=True)
+        emb.add_field(name="Automation", value=f"Active subscriptions **{stats['active_subscriptions']:,}**\nServer subscriptions **{stats['server_subscriptions']:,}**\nSticky dashboards **{stats['sticky_dashboards']:,}**", inline=True)
+        emb.add_field(name="Today", value=f"Weather lookups **{today.get('weather_lookup',0):,}**\nReports sent **{today.get('scheduled_sent',0):,}**\nThreshold skips **{today.get('scheduled_skipped',0):,}**\nScheduler errors **{today.get('scheduler_error',0):,}", inline=True)
+        emb.add_field(name="Pending", value=f"Feature requests **{stats['pending_features']:,}**\nBug reports **{stats['pending_bugs']:,}**", inline=False)
+        emb.set_footer(text="Analytics begin accumulating after upgrading to 2.0.1; aggregate database totals are immediate.")
+        return emb
+
+    @app_commands.command(name="owner_analytics", description="Owner: open Weather Bot analytics.")
+    async def owner_analytics(self, inter: discord.Interaction):
+        if not self._is_staff(inter.user):
+            return await inter.response.send_message("Only the configured bot owner can use this command.", ephemeral=True)
+        await inter.response.send_message(embed=self.owner_analytics_embed(), view=OwnerAnalyticsView(self, inter.user.id), ephemeral=True)
+
+    async def refresh_sticky_dashboard(self, row: Dict[str, Any], message=None):
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            loc={"display_name":row["location_name"],"latitude":row["latitude"],"longitude":row["longitude"]}
+            emb=await self._current_embed(session, loc, row["units"], row["timezone"])
+        emb.title = emb.title.replace("Weather —", "Live Weather —")
+        emb.description = (emb.description or "") + "\n\n*This message refreshes automatically.*"
+        emb.set_footer(text=f"Weather Bot {BOT_VERSION} • Updated {datetime.now(_tzinfo_from_name(row['timezone'])).strftime('%b %d, %I:%M %p %Z')} • Every {row['refresh_minutes']} min")
+        if message is None:
+            channel=self.bot.get_channel(int(row["channel_id"])) or await self.bot.fetch_channel(int(row["channel_id"]))
+            message=await channel.fetch_message(int(row["message_id"]))
+        await message.edit(embed=emb, view=StickyWeatherView(self))
+        self.store.update_sticky_dashboard(row["id"], last_refresh_at=datetime.now(timezone.utc).isoformat(), last_error=None)
+
+    @app_commands.command(name="sticky_weather_create", description="Create an automatically refreshing weather dashboard in a channel.")
+    @app_commands.describe(channel="Channel that will contain the dashboard", location="City, place, postal code, or your saved default", refresh_minutes="Refresh interval; 15 minutes recommended")
+    async def sticky_weather_create(self, inter: discord.Interaction, channel: discord.TextChannel, location: Optional[str]=None, refresh_minutes: app_commands.Range[int,5,60]=15):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:
+            return await inter.response.send_message("You need **Manage Server** to create a sticky dashboard.", ephemeral=True)
+        perms=channel.permissions_for(inter.guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links and perms.read_message_history):
+            return await inter.response.send_message("I need View Channel, Send Messages, Embed Links, and Read Message History there.", ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                loc=await self._resolve_location(session, inter.user.id, location)
+            units=_get_user_units(self.store, inter.user.id); tz=loc.get("timezone") or _get_user_tz_name(self.store, inter.user.id)
+            placeholder=await channel.send(embed=discord.Embed(title="🌦️ Creating weather dashboard…", colour=discord.Colour.blurple()))
+            did=self.store.add_sticky_dashboard({"guild_id":inter.guild.id,"channel_id":channel.id,"message_id":placeholder.id,"created_by":inter.user.id,"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"timezone":tz,"units":units,"refresh_minutes":refresh_minutes,"enabled":1})
+            row=self.store.get_sticky_dashboard(dashboard_id=did); await self.refresh_sticky_dashboard(row, placeholder)
+            await inter.followup.send(f"✅ Sticky dashboard **#{did}** created in {channel.mention}.", ephemeral=True)
+        except Exception as exc:
+            await inter.followup.send(f"⚠️ Could not create the dashboard: {exc}", ephemeral=True)
+
+    @app_commands.command(name="sticky_weather_list", description="List this server's sticky weather dashboards.")
+    async def sticky_weather_list(self, inter: discord.Interaction):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:
+            return await inter.response.send_message("You need **Manage Server** to manage sticky dashboards.", ephemeral=True)
+        rows=self.store.list_sticky_dashboards(guild_id=inter.guild.id)
+        text="\n".join(f"**#{r['id']}** · <#{r['channel_id']}> · {r['location_name']} · every {r['refresh_minutes']} min · {'active' if r['enabled'] else 'paused'}" for r in rows) or "No sticky dashboards configured."
+        await inter.response.send_message(embed=discord.Embed(title="Sticky Weather Dashboards", description=text, colour=discord.Colour.blurple()), ephemeral=True)
+
+    @app_commands.command(name="sticky_weather_delete", description="Delete a sticky weather dashboard.")
+    async def sticky_weather_delete(self, inter: discord.Interaction, dashboard_id: int):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:
+            return await inter.response.send_message("You need **Manage Server** to manage sticky dashboards.", ephemeral=True)
+        row=self.store.get_sticky_dashboard(dashboard_id=dashboard_id)
+        if not row or row["guild_id"] != inter.guild.id:
+            return await inter.response.send_message("Dashboard not found in this server.", ephemeral=True)
+        try:
+            channel=self.bot.get_channel(int(row["channel_id"])) or await self.bot.fetch_channel(int(row["channel_id"]))
+            msg=await channel.fetch_message(int(row["message_id"])); await msg.delete()
+        except Exception: pass
+        self.store.remove_sticky_dashboard(dashboard_id, inter.guild.id)
+        await inter.response.send_message("✅ Sticky dashboard deleted.", ephemeral=True)
+
+    @tasks.loop(minutes=1)
+    async def sticky_dashboard_scheduler(self):
+        now=datetime.now(timezone.utc)
+        for row in self.store.list_sticky_dashboards(enabled_only=True):
+            try:
+                last=datetime.fromisoformat(row["last_refresh_at"]) if row.get("last_refresh_at") else datetime.fromtimestamp(0, timezone.utc)
+                if last.tzinfo is None: last=last.replace(tzinfo=timezone.utc)
+                if now-last < timedelta(minutes=max(5,int(row.get("refresh_minutes") or 15))): continue
+                await self.refresh_sticky_dashboard(row)
+            except Exception as exc:
+                self.store.update_sticky_dashboard(row["id"], last_error=str(exc)[:300])
+
+    @sticky_dashboard_scheduler.before_loop
+    async def before_sticky_dashboards(self): await self.bot.wait_until_ready()
 
     @app_commands.command(name="wx_alerts", description="Enable or disable US NWS alerts by DM.")
     async def wx_alerts(self, inter: discord.Interaction, mode: str, min_severity: Optional[str]="moderate"):
