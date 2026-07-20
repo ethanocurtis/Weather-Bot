@@ -238,3 +238,10 @@ The primary command layout is now:
 The dashboard builds on the existing subscription and weather-role setup wizards instead of introducing duplicate setup flows. Existing configuration commands remain available as compatibility shortcuts.
 
 > Discord slash commands cannot simultaneously provide an executable `/weather` command and a `/weather dashboard` subcommand. The bot keeps `/weather` for quick access and uses `/dashboard` for management.
+
+
+## Radar
+
+Use `/radar` for a current NOAA/NWS MRMS base-reflectivity image around a US location. The command uses your saved default location when no location is provided and supports 25, 50, 100, and 250-mile ranges. Radar is also available from `/dashboard` and documented in `/help`.
+
+The first radar release is static and US-focused. The provider layer is isolated so animation and worldwide providers can be added later.

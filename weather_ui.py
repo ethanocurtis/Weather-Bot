@@ -8,6 +8,7 @@ import discord
 
 HELP_PAGES = {
     "weather": ("🌤️ Weather & Forecasts", "`/weather` gives quick current conditions, `/brief` gives a quick plain-language briefing, `/hourly` gives an hourly forecast, and `/moon` shows the moon phase."),
+    "radar": ("🛰️ Weather Radar", "Use `/radar` for the latest NOAA/NWS base-reflectivity image around your default or specified US location. Choose a 25, 50, 100, or 250-mile range, then use the buttons to refresh, change location, open the forecast, or create a briefing."),
     "air": ("🌬️ Air & Pollen", "Use `/air_quality` for US AQI, particulate levels, and available pollen forecasts. Pollen availability varies by region and season."),
     "locations": ("📍 Locations", "`/location_set` saves a worldwide city, place, or postal code. `/locations` lists saved locations. `/weather_set_zip` remains available for legacy US ZIP setup."),
     "subscriptions": ("🔔 Personal & Channel Subscriptions", "Use `/dashboard` as the main control center, or `/weather_subscribe` to jump directly into the guided wizard. Choose either a forecast outlook or a weather briefing, then destination, location, schedule, and optional threshold. `/weather_subscriptions` manages existing subscriptions; `/weather_subscribe_advanced` is the power-user fallback."),
@@ -40,6 +41,7 @@ class HelpSelect(discord.ui.Select):
             placeholder="Choose a help topic…",
             options=[
                 discord.SelectOption(label="Weather & Forecasts", value="weather", emoji="🌤️"),
+                discord.SelectOption(label="Weather Radar", value="radar", emoji="🛰️"),
                 discord.SelectOption(label="Air & Pollen", value="air", emoji="🌬️"),
                 discord.SelectOption(label="Locations", value="locations", emoji="📍"),
                 discord.SelectOption(label="Subscriptions", value="subscriptions", emoji="🔔"),
@@ -452,7 +454,7 @@ def dashboard_home_embed(cog, interaction: discord.Interaction) -> discord.Embed
     default = next((r for r in locations if r.get("is_default")), locations[0] if locations else None)
     embed = discord.Embed(
         title="🌦️ Weather Dashboard",
-        description="Use this dashboard to manage weather features. Quick lookups remain available through `/weather` and `/brief`.",
+        description="Use this dashboard to manage weather features. Quick lookups remain available through `/weather`, `/brief`, and `/radar`.",
         colour=discord.Colour.blurple(),
     )
     embed.add_field(
@@ -491,6 +493,10 @@ class WeatherDashboardView(OwnedView):
     def __init__(self, cog, owner_id: int):
         super().__init__(owner_id, timeout=600)
         self.cog = cog
+
+    @discord.ui.button(label="Radar", emoji="🛰️", style=discord.ButtonStyle.primary, row=0)
+    async def radar(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog.send_radar(interaction, None, 100, ephemeral=True)
 
     @discord.ui.button(label="New Subscription", emoji="➕", style=discord.ButtonStyle.success, row=0)
     async def new_subscription(self, interaction: discord.Interaction, _button: discord.ui.Button):

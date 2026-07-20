@@ -3,6 +3,8 @@ import os
 import re
 import html
 import json
+import io
+import math
 import aiohttp
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -25,7 +27,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 
 
 
@@ -703,6 +705,84 @@ class WeatherRoleToggleButton(discord.ui.Button):
             )
 
 
+
+
+RADAR_SERVICE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/radar_base_reflectivity_time/ImageServer/exportImage"
+RADAR_ALLOWED_RANGES = (25, 50, 100, 250)
+
+
+class RadarLocationModal(discord.ui.Modal, title="Change Radar Location"):
+    location = discord.ui.TextInput(
+        label="US city, place, or ZIP code",
+        placeholder="Chicago, IL or 60601",
+        max_length=120,
+    )
+
+    def __init__(self, cog, owner_id: int, range_miles: int):
+        super().__init__()
+        self.cog = cog
+        self.owner_id = owner_id
+        self.range_miles = range_miles
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            return await interaction.response.send_message("This radar menu belongs to someone else.", ephemeral=True)
+        await self.cog.send_radar(interaction, str(self.location), self.range_miles, ephemeral=True)
+
+
+class RadarView(discord.ui.View):
+    def __init__(self, cog, owner_id: int, location_query: Optional[str], range_miles: int):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.owner_id = int(owner_id)
+        self.location_query = location_query
+        self.range_miles = range_miles
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This radar menu belongs to someone else.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Refresh", emoji="🔄", style=discord.ButtonStyle.primary, row=0)
+    async def refresh(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog.send_radar(interaction, self.location_query, self.range_miles, ephemeral=True)
+
+    @discord.ui.button(label="Change Location", emoji="📍", style=discord.ButtonStyle.secondary, row=0)
+    async def change_location(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.send_modal(RadarLocationModal(self.cog, self.owner_id, self.range_miles))
+
+    @discord.ui.select(
+        placeholder="Change radar range…",
+        min_values=1,
+        max_values=1,
+        options=[
+            discord.SelectOption(label="25 miles", value="25"),
+            discord.SelectOption(label="50 miles", value="50"),
+            discord.SelectOption(label="100 miles", value="100"),
+            discord.SelectOption(label="250 miles", value="250"),
+        ],
+        row=1,
+    )
+    async def change_range(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await self.cog.send_radar(interaction, self.location_query, int(select.values[0]), ephemeral=True)
+
+    @discord.ui.button(label="Forecast", emoji="🌤️", style=discord.ButtonStyle.secondary, row=2)
+    async def forecast(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                loc = await self.cog._resolve_location(session, interaction.user.id, self.location_query)
+                tz = loc.get("timezone") or _get_user_tz_name(self.cog.store, interaction.user.id)
+                embed = await self.cog._current_embed(session, loc, _get_user_units(self.cog.store, interaction.user.id), tz)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
+    @discord.ui.button(label="Briefing", emoji="📝", style=discord.ButtonStyle.secondary, row=2)
+    async def briefing(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog._send_briefing_command(interaction, self.location_query)
+
 class Weather(commands.Cog):
     """Weather, locations, subscriptions, alerts, and feedback tracking."""
     def __init__(self, bot: commands.Bot, store=None):
@@ -1037,6 +1117,69 @@ class Weather(commands.Cog):
         emb.add_field(name="UV",value=str((daily.get('uv_index_max') or ['?'])[0]))
         emb.set_footer(text=f"Units: {units} • Timezone: {tz_name}")
         return emb
+
+
+    @staticmethod
+    def _radar_bbox(latitude: float, longitude: float, range_miles: int) -> str:
+        radius = max(RADAR_ALLOWED_RANGES, key=lambda value: -abs(value - int(range_miles)))
+        lat_delta = radius / 69.0
+        cos_lat = max(0.20, abs(math.cos(math.radians(latitude))))
+        lon_delta = radius / (69.172 * cos_lat)
+        return f"{longitude-lon_delta:.6f},{latitude-lat_delta:.6f},{longitude+lon_delta:.6f},{latitude+lat_delta:.6f}"
+
+    async def _fetch_radar_image(self, session: aiohttp.ClientSession, loc: Dict[str, Any], range_miles: int) -> bytes:
+        params = {
+            "bbox": self._radar_bbox(float(loc["latitude"]), float(loc["longitude"]), range_miles),
+            "bboxSR": "4326",
+            "imageSR": "4326",
+            "size": "900,700",
+            "format": "png32",
+            "transparent": "false",
+            "f": "image",
+        }
+        async with session.get(RADAR_SERVICE_URL, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+            data = await response.read()
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            if response.status != 200 or not content_type.startswith("image/") or len(data) < 100:
+                raise RuntimeError("NOAA radar imagery is temporarily unavailable.")
+            return data
+
+    async def send_radar(self, interaction: discord.Interaction, location: Optional[str], range_miles: int = 100, *, ephemeral: bool = False):
+        range_miles = min(RADAR_ALLOWED_RANGES, key=lambda value: abs(value - int(range_miles)))
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                loc = await self._resolve_location(session, interaction.user.id, location)
+                country = (loc.get("country_code") or "").upper()
+                if country not in {"US", "USA"}:
+                    raise RuntimeError("Radar currently supports US locations. Worldwide radar can be added through another provider later.")
+                image = await self._fetch_radar_image(session, loc, range_miles)
+            file = discord.File(io.BytesIO(image), filename="radar.png")
+            embed = discord.Embed(
+                title=f"🛰️ Radar — {loc['display_name']}",
+                description=f"Latest NOAA/NWS base reflectivity · **{range_miles}-mile range**",
+                colour=discord.Colour.blurple(),
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_image(url="attachment://radar.png")
+            embed.set_footer(text="NOAA/NWS MRMS radar • Refreshes approximately every 5 minutes")
+            view = RadarView(self, interaction.user.id, loc["display_name"], range_miles)
+            await interaction.followup.send(embed=embed, file=file, view=view, ephemeral=ephemeral)
+            self.store.record_event("radar_lookup", interaction.user.id, interaction.guild.id if interaction.guild else None)
+        except Exception as exc:
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+
+    @app_commands.command(name="radar", description="Show NOAA weather radar for a US location.")
+    @app_commands.describe(location="US city, place, ZIP code, or saved location", range_miles="Radar radius around the location")
+    @app_commands.choices(range_miles=[
+        app_commands.Choice(name="25 miles", value=25),
+        app_commands.Choice(name="50 miles", value=50),
+        app_commands.Choice(name="100 miles", value=100),
+        app_commands.Choice(name="250 miles", value=250),
+    ])
+    async def radar_cmd(self, inter: discord.Interaction, location: Optional[str] = None, range_miles: Optional[app_commands.Choice[int]] = None):
+        await self.send_radar(inter, location, range_miles.value if range_miles else 100)
 
     @app_commands.command(name="weather", description="Current weather for any city, postal code, or saved location.")
     async def weather_cmd(self, inter: discord.Interaction, location: Optional[str]=None):
