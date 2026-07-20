@@ -133,6 +133,61 @@ class WxStore:
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_analytics_type_time ON analytics_events(event_type, created_at)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS server_weather_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                location_name TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                country_code TEXT,
+                timezone TEXT NOT NULL,
+                units TEXT NOT NULL DEFAULT 'standard',
+                cadence TEXT NOT NULL,
+                hh INTEGER NOT NULL,
+                mi INTEGER NOT NULL,
+                weekly_day INTEGER NOT NULL DEFAULT 0,
+                include_air INTEGER NOT NULL DEFAULT 1,
+                include_pollen INTEGER NOT NULL DEFAULT 1,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                next_run_utc TEXT NOT NULL,
+                last_sent_at TEXT,
+                last_error TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_server_weather_next ON server_weather_posts(next_run_utc, enabled)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_server_weather_guild ON server_weather_posts(guild_id)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS weather_role_configs (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                location_name TEXT NOT NULL,
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                country_code TEXT,
+                timezone TEXT NOT NULL,
+                min_severity TEXT NOT NULL DEFAULT 'moderate',
+                storm_role_id INTEGER,
+                winter_role_id INTEGER,
+                tornado_role_id INTEGER,
+                flood_role_id INTEGER,
+                heat_role_id INTEGER,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS server_seen_alerts (
+                guild_id INTEGER NOT NULL,
+                alert_id TEXT NOT NULL,
+                seen_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, alert_id)
+            )
+        """)
         self.db.commit()
 
     # Legacy ZIP compatibility
@@ -300,3 +355,56 @@ class WxStore:
             "pending_bugs": scalar("SELECT COUNT(*) FROM feedback_requests WHERE request_type='bug' AND status NOT IN ('completed','declined','duplicate','fixed')"),
             "events_today": events,
         }
+
+
+    # Scheduled server weather posts
+    def add_server_weather_post(self, data: Dict[str, Any]) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        fields = ["guild_id","channel_id","created_by","location_name","latitude","longitude","country_code","timezone","units","cadence","hh","mi","weekly_day","include_air","include_pollen","enabled","next_run_utc","created_at"]
+        vals = [data.get(f) for f in fields]
+        vals[-1] = now
+        cur = self.db.execute(f"INSERT INTO server_weather_posts({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", vals)
+        self.db.commit(); return int(cur.lastrowid)
+
+    def list_server_weather_posts(self, guild_id: Optional[int] = None, due_before: Optional[str] = None, enabled_only: bool = False) -> List[Dict[str, Any]]:
+        where, args = [], []
+        if guild_id is not None: where.append("guild_id=?"); args.append(int(guild_id))
+        if due_before is not None: where.append("next_run_utc<=?"); args.append(str(due_before))
+        if enabled_only: where.append("enabled=1")
+        sql = "SELECT * FROM server_weather_posts" + ((" WHERE " + " AND ".join(where)) if where else "") + " ORDER BY next_run_utc"
+        return [dict(r) for r in self.db.execute(sql,args).fetchall()]
+
+    def get_server_weather_post(self, post_id: int) -> Optional[Dict[str, Any]]:
+        row=self.db.execute("SELECT * FROM server_weather_posts WHERE id=?",(int(post_id),)).fetchone(); return dict(row) if row else None
+
+    def update_server_weather_post(self, post_id: int, **updates) -> None:
+        allowed={"enabled","next_run_utc","last_sent_at","last_error"}; updates={k:v for k,v in updates.items() if k in allowed}
+        if not updates:return
+        self.db.execute(f"UPDATE server_weather_posts SET {','.join(f'{k}=?' for k in updates)} WHERE id=?",[*updates.values(),int(post_id)]); self.db.commit()
+
+    def remove_server_weather_post(self, post_id: int, guild_id: int) -> bool:
+        cur=self.db.execute("DELETE FROM server_weather_posts WHERE id=? AND guild_id=?",(int(post_id),int(guild_id))); self.db.commit(); return cur.rowcount>0
+
+    # Weather role configuration and alert deduplication
+    def set_weather_role_config(self, data: Dict[str, Any]) -> None:
+        now=datetime.now(timezone.utc).isoformat()
+        fields=["guild_id","channel_id","location_name","latitude","longitude","country_code","timezone","min_severity","storm_role_id","winter_role_id","tornado_role_id","flood_role_id","heat_role_id","enabled","created_by","updated_at"]
+        vals=[data.get(f) for f in fields]; vals[-1]=now
+        updates=','.join(f"{f}=excluded.{f}" for f in fields[1:])
+        self.db.execute(f"INSERT INTO weather_role_configs({','.join(fields)}) VALUES({','.join('?' for _ in fields)}) ON CONFLICT(guild_id) DO UPDATE SET {updates}",vals); self.db.commit()
+
+    def get_weather_role_config(self, guild_id: int) -> Optional[Dict[str, Any]]:
+        row=self.db.execute("SELECT * FROM weather_role_configs WHERE guild_id=?",(int(guild_id),)).fetchone(); return dict(row) if row else None
+
+    def list_weather_role_configs(self, enabled_only: bool=True) -> List[Dict[str, Any]]:
+        sql="SELECT * FROM weather_role_configs" + (" WHERE enabled=1" if enabled_only else "")
+        return [dict(r) for r in self.db.execute(sql).fetchall()]
+
+    def delete_weather_role_config(self, guild_id: int) -> bool:
+        cur=self.db.execute("DELETE FROM weather_role_configs WHERE guild_id=?",(int(guild_id),)); self.db.commit(); return cur.rowcount>0
+
+    def server_alert_seen(self, guild_id: int, alert_id: str) -> bool:
+        return self.db.execute("SELECT 1 FROM server_seen_alerts WHERE guild_id=? AND alert_id=?",(int(guild_id),str(alert_id))).fetchone() is not None
+
+    def mark_server_alert_seen(self, guild_id: int, alert_id: str) -> None:
+        self.db.execute("INSERT OR IGNORE INTO server_seen_alerts(guild_id,alert_id,seen_at) VALUES(?,?,?)",(int(guild_id),str(alert_id),datetime.now(timezone.utc).isoformat())); self.db.commit()

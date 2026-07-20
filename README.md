@@ -185,3 +185,33 @@ Weather-Bot-main/
 - Open-Meteo Forecast API — forecasts
 - National Weather Service API — US alerts
 - Astral — moon phases
+
+## Version 2.1 server features
+
+### Weather briefings and air quality
+
+- `/weather_briefing [location]` creates a plain-language summary of the day's temperature, rain, wind, UV, and available air quality.
+- `/air_quality [location]` shows US AQI, PM2.5, PM10, and pollen data when the provider has coverage.
+- Pollen coverage varies by region and season. Open-Meteo currently provides its pollen variables primarily for Europe during pollen season.
+
+### Daily and weekly server posts
+
+Administrators with **Manage Server** can schedule polished forecast briefings in a channel:
+
+- `/server_weather_post_create`
+- `/server_weather_posts`
+- `/server_weather_post_delete`
+
+The creation command accepts `daily` or `weekly`, a local delivery time, a destination channel, and an optional location. Weekly days use `0` for Monday through `6` for Sunday. Reports include a forecast briefing, daily outlook rows, air quality, and pollen when available.
+
+### Opt-in weather roles
+
+Use `/weather_roles_setup` to connect optional server roles to US National Weather Service alerts. Supported categories are:
+
+- `storm`
+- `winter`
+- `tornado`
+- `flood`
+- `heat`
+
+Members opt in and out with `/weather_role_join` and `/weather_role_leave`. The bot needs **Manage Roles**, and its highest role must be above every alert role it manages. Server role alerts currently require a US location because they use the National Weather Service alert feed.

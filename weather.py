@@ -25,7 +25,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.0.1"
+BOT_VERSION = "2.1.0"
 
 
 
@@ -348,6 +348,95 @@ class RequestStatusView(discord.ui.View):
         await self._set(interaction, "declined")
 
 
+
+async def _fetch_air_quality(session: aiohttp.ClientSession, lat: float, lon: float, tz_name: str) -> Dict[str, Any]:
+    params = {
+        "latitude": lat, "longitude": lon, "timezone": tz_name,
+        "current": "us_aqi,pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,ozone",
+        "hourly": "alder_pollen,birch_pollen,grass_pollen,mugwort_pollen,olive_pollen,ragweed_pollen",
+        "forecast_days": 2,
+    }
+    async with session.get("https://air-quality-api.open-meteo.com/v1/air-quality", params=params, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        if r.status != 200:
+            raise RuntimeError("Air-quality API unavailable.")
+        data = await r.json()
+    current = data.get("current") or {}
+    hourly = data.get("hourly") or {}
+    pollen = {}
+    for key in ("alder_pollen","birch_pollen","grass_pollen","mugwort_pollen","olive_pollen","ragweed_pollen"):
+        vals = [v for v in (hourly.get(key) or [])[:24] if isinstance(v,(int,float))]
+        pollen[key] = max(vals) if vals else None
+    return {"current": current, "pollen": pollen}
+
+
+def _aqi_label(value: Optional[float]) -> Tuple[str, discord.Colour]:
+    if value is None: return "Unavailable", discord.Colour.light_grey()
+    v=float(value)
+    if v <= 50: return "Good", discord.Colour.green()
+    if v <= 100: return "Moderate", discord.Colour.gold()
+    if v <= 150: return "Unhealthy for sensitive groups", discord.Colour.orange()
+    if v <= 200: return "Unhealthy", discord.Colour.red()
+    if v <= 300: return "Very unhealthy", discord.Colour.dark_red()
+    return "Hazardous", discord.Colour.dark_magenta()
+
+
+def _pollen_level(value: Optional[float]) -> str:
+    if value is None: return "Unavailable"
+    v=float(value)
+    if v < 1: return "None"
+    if v < 10: return "Low"
+    if v < 50: return "Moderate"
+    if v < 200: return "High"
+    return "Very high"
+
+
+def _weather_briefing(location_name: str, outlook: List[Tuple], units: str, air: Optional[Dict[str,Any]]=None) -> str:
+    if not outlook: return f"No forecast is currently available for {location_name}."
+    d,line,_,_,uv,hi,metrics=outlook[0]
+    icon, desc = wx_icon_desc(0)
+    # Pull description from the already formatted outlook line without exposing markup.
+    condition = re.sub(r"^\S+\s+", "", line).split(" — ",1)[0]
+    temp_unit = "°F" if units == "standard" else "°C"
+    wind_unit = "mph" if units == "standard" else "km/h"
+    parts=[f"Expect **{condition.lower()}** in **{location_name}** today."]
+    if metrics.get("max_temp") is not None and metrics.get("min_temp") is not None:
+        parts.append(f"Temperatures should range from **{round(metrics['min_temp'])}{temp_unit}** to **{round(metrics['max_temp'])}{temp_unit}**.")
+    rain=metrics.get("rain_chance")
+    if rain is not None:
+        if rain >= 70: parts.append(f"Rain is likely, with a peak chance near **{round(rain)}%**; plan for wet conditions.")
+        elif rain >= 35: parts.append(f"There is a **{round(rain)}%** chance of rain, so keeping rain gear nearby would be sensible.")
+        else: parts.append(f"Rain is unlikely, with a peak chance near **{round(rain)}%**.")
+    wind=metrics.get("max_wind")
+    if wind is not None:
+        if wind >= (25 if units=='standard' else 40): parts.append(f"Winds may be strong, reaching about **{round(wind)} {wind_unit}**; secure loose outdoor items.")
+        else: parts.append(f"Winds should peak near **{round(wind)} {wind_unit}**.")
+    if uv is not None and uv >= 6: parts.append(f"The UV index may reach **{round(uv,1)}**, so sun protection is recommended.")
+    if air:
+        aqi=air.get("current",{}).get("us_aqi")
+        label,_=_aqi_label(aqi)
+        if aqi is not None: parts.append(f"Air quality is **{label.lower()}** with a US AQI near **{round(aqi)}**.")
+    return " ".join(parts)
+
+
+def _server_next_run(tz_name: str, hh: int, mi: int, cadence: str, weekly_day: int=0) -> datetime:
+    now=datetime.now(_tzinfo_from_name(tz_name))
+    target=now.replace(hour=hh,minute=mi,second=0,microsecond=0)
+    if cadence == "weekly":
+        target += timedelta(days=(weekly_day-target.weekday())%7)
+        if target <= now: target += timedelta(days=7)
+    elif target <= now:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc)
+
+
+def _alert_category(event: str) -> str:
+    e=(event or "").lower()
+    if "tornado" in e: return "tornado"
+    if any(x in e for x in ("winter","snow","ice","blizzard","freeze")): return "winter"
+    if any(x in e for x in ("flood","flash flood")): return "flood"
+    if any(x in e for x in ("heat","excessive heat")): return "heat"
+    return "storm"
+
 class StickyWeatherView(discord.ui.View):
     """Persistent controls attached to every sticky weather dashboard."""
     def __init__(self, cog):
@@ -434,9 +523,10 @@ class Weather(commands.Cog):
         self.weather_scheduler.start()
         self.wx_alerts_scheduler.start()
         self.sticky_dashboard_scheduler.start()
+        self.server_weather_scheduler.start()
 
     def cog_unload(self):
-        self.weather_scheduler.cancel(); self.wx_alerts_scheduler.cancel(); self.sticky_dashboard_scheduler.cancel()
+        self.weather_scheduler.cancel(); self.wx_alerts_scheduler.cancel(); self.sticky_dashboard_scheduler.cancel(); self.server_weather_scheduler.cancel()
 
     def _is_staff(self, user) -> bool:
         return bool(BOT_OWNER_ID and int(user.id) == BOT_OWNER_ID)
@@ -825,6 +915,127 @@ class Weather(commands.Cog):
     @weather_scheduler.before_loop
     async def before_weather(self): await self.bot.wait_until_ready()
 
+
+    async def _air_embed(self, loc: Dict[str,Any]) -> discord.Embed:
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            data=await _fetch_air_quality(session,float(loc["latitude"]),float(loc["longitude"]),loc.get("timezone") or DEFAULT_TZ_NAME)
+        current=data["current"]; aqi=current.get("us_aqi"); label,color=_aqi_label(aqi)
+        emb=discord.Embed(title=f"🌬️ Air & Pollen — {loc['display_name']}",description=f"**US AQI:** {round(aqi) if aqi is not None else 'Unavailable'} · **{label}**",colour=color,timestamp=datetime.now(timezone.utc))
+        emb.add_field(name="Particles",value=f"PM2.5: **{current.get('pm2_5','—')} μg/m³**\nPM10: **{current.get('pm10','—')} μg/m³**",inline=True)
+        pol=data["pollen"]; lines=[]
+        for key,val in pol.items():
+            if val is not None: lines.append(f"{key.replace('_pollen','').title()}: **{_pollen_level(val)}** ({val:.1f})")
+        emb.add_field(name="Pollen (next 24h)",value="\n".join(lines) if lines else "Pollen data is unavailable for this location or season.",inline=True)
+        emb.set_footer(text="Pollen coverage varies by region and season.")
+        return emb
+
+    @app_commands.command(name="air_quality", description="Show air quality and available pollen forecasts for a location.")
+    async def air_quality(self, inter: discord.Interaction, location: Optional[str]=None):
+        await inter.response.defer()
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session: loc=await self._resolve_location(session,inter.user.id,location)
+            await inter.followup.send(embed=await self._air_embed(loc))
+            self.store.record_event("air_quality_lookup",inter.user.id,inter.guild.id if inter.guild else None)
+        except Exception as exc: await inter.followup.send(f"⚠️ Could not load air quality: {exc}")
+
+    @app_commands.command(name="weather_briefing", description="Get a plain-language weather, air-quality, and pollen briefing.")
+    async def weather_briefing(self, inter: discord.Interaction, location: Optional[str]=None):
+        await inter.response.defer()
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+                loc=await self._resolve_location(session,inter.user.id,location); units=_get_user_units(self.store,inter.user.id); tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id)
+                outlook=await _fetch_outlook(session,float(loc["latitude"]),float(loc["longitude"]),2,tz,units)
+                try: air=await _fetch_air_quality(session,float(loc["latitude"]),float(loc["longitude"]),tz)
+                except Exception: air=None
+            emb=discord.Embed(title=f"🌤️ Weather Briefing — {loc['display_name']}",description=_weather_briefing(loc['display_name'],outlook,units,air),colour=wx_color_from_temp_f(outlook[0][5] if units=='standard' else (outlook[0][5]*9/5+32 if outlook[0][5] is not None else None)),timestamp=datetime.now(timezone.utc))
+            await inter.followup.send(embed=emb); self.store.record_event("weather_briefing",inter.user.id,inter.guild.id if inter.guild else None)
+        except Exception as exc: await inter.followup.send(f"⚠️ Could not create the briefing: {exc}")
+
+    @app_commands.command(name="server_weather_post_create", description="Create a daily or weekly server weather briefing.")
+    @app_commands.describe(channel="Destination channel", cadence="daily or weekly", time="Local time such as 7:00am", location="City, place, postal code, or saved default", weekly_day="0=Monday through 6=Sunday")
+    async def server_weather_post_create(self, inter: discord.Interaction, channel: discord.TextChannel, cadence: str, time: str, location: Optional[str]=None, weekly_day: app_commands.Range[int,0,6]=0):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild: return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
+        cadence=cadence.lower()
+        if cadence not in {"daily","weekly"}: return await inter.response.send_message("Cadence must be `daily` or `weekly`.",ephemeral=True)
+        perms=channel.permissions_for(inter.guild.me)
+        if not(perms.view_channel and perms.send_messages and perms.embed_links): return await inter.response.send_message("I need View Channel, Send Messages, and Embed Links there.",ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            hh,mi=_parse_time(time)
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session: loc=await self._resolve_location(session,inter.user.id,location)
+            tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id); units=_get_user_units(self.store,inter.user.id); nxt=_server_next_run(tz,hh,mi,cadence,weekly_day)
+            pid=self.store.add_server_weather_post({"guild_id":inter.guild.id,"channel_id":channel.id,"created_by":inter.user.id,"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"timezone":tz,"units":units,"cadence":cadence,"hh":hh,"mi":mi,"weekly_day":weekly_day,"include_air":1,"include_pollen":1,"enabled":1,"next_run_utc":nxt.isoformat()})
+            await inter.followup.send(f"✅ Server weather post **#{pid}** will run {cadence} in {channel.mention}. Next run: <t:{int(nxt.timestamp())}:F>.",ephemeral=True)
+        except Exception as exc: await inter.followup.send(f"⚠️ Could not create server post: {exc}",ephemeral=True)
+
+    @app_commands.command(name="server_weather_posts", description="List this server's scheduled weather posts.")
+    async def server_weather_posts(self, inter: discord.Interaction):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
+        rows=self.store.list_server_weather_posts(guild_id=inter.guild.id)
+        text="\n".join(f"**#{r['id']}** · <#{r['channel_id']}> · {r['cadence']} at {r['hh']:02d}:{r['mi']:02d} · {r['location_name']} · {'active' if r['enabled'] else 'paused'}" for r in rows) or "No scheduled server posts."
+        await inter.response.send_message(embed=discord.Embed(title="Server Weather Posts",description=text,colour=discord.Colour.blurple()),ephemeral=True)
+
+    @app_commands.command(name="server_weather_post_delete", description="Delete a scheduled server weather post.")
+    async def server_weather_post_delete(self, inter: discord.Interaction, post_id: int):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
+        ok=self.store.remove_server_weather_post(post_id,inter.guild.id); await inter.response.send_message("✅ Deleted." if ok else "Post not found in this server.",ephemeral=True)
+
+    @app_commands.command(name="weather_roles_setup", description="Configure opt-in weather alert roles for this server (US alerts).")
+    async def weather_roles_setup(self, inter: discord.Interaction, channel: discord.TextChannel, location: str, storm_role: Optional[discord.Role]=None, winter_role: Optional[discord.Role]=None, tornado_role: Optional[discord.Role]=None, flood_role: Optional[discord.Role]=None, heat_role: Optional[discord.Role]=None, min_severity: str="moderate"):
+        if not inter.guild or not inter.user.guild_permissions.manage_guild:return await inter.response.send_message("You need **Manage Server**.",ephemeral=True)
+        await inter.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session: loc=await self._resolve_location(session,inter.user.id,location)
+            if loc.get("country_code") != "US": return await inter.followup.send("Server role alerts currently use the US National Weather Service and require a US location.",ephemeral=True)
+            self.store.set_weather_role_config({"guild_id":inter.guild.id,"channel_id":channel.id,"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"timezone":loc.get("timezone") or DEFAULT_TZ_NAME,"min_severity":min_severity.lower(),"storm_role_id":storm_role.id if storm_role else None,"winter_role_id":winter_role.id if winter_role else None,"tornado_role_id":tornado_role.id if tornado_role else None,"flood_role_id":flood_role.id if flood_role else None,"heat_role_id":heat_role.id if heat_role else None,"enabled":1,"created_by":inter.user.id})
+            await inter.followup.send("✅ Weather roles configured. Members can use `/weather_role_join` and `/weather_role_leave`.",ephemeral=True)
+        except Exception as exc: await inter.followup.send(f"⚠️ Setup failed: {exc}",ephemeral=True)
+
+    async def _change_weather_role(self, inter: discord.Interaction, category: str, add: bool):
+        if not inter.guild:return await inter.response.send_message("Use this command in a server.",ephemeral=True)
+        cfg=self.store.get_weather_role_config(inter.guild.id); category=category.lower()
+        if not cfg or category not in {"storm","winter","tornado","flood","heat"}:return await inter.response.send_message("That weather role is not configured.",ephemeral=True)
+        rid=cfg.get(f"{category}_role_id"); role=inter.guild.get_role(int(rid)) if rid else None
+        if not role:return await inter.response.send_message(f"The {category} role is not configured.",ephemeral=True)
+        try:
+            if add: await inter.user.add_roles(role,reason="Weather alert opt-in")
+            else: await inter.user.remove_roles(role,reason="Weather alert opt-out")
+            await inter.response.send_message(f"✅ {'Added' if add else 'Removed'} {role.mention}.",ephemeral=True)
+        except discord.Forbidden: await inter.response.send_message("I cannot manage that role. Move my bot role above it and grant Manage Roles.",ephemeral=True)
+
+    @app_commands.command(name="weather_role_join", description="Join an opt-in server weather alert role.")
+    async def weather_role_join(self, inter: discord.Interaction, category: str): await self._change_weather_role(inter,category,True)
+    @app_commands.command(name="weather_role_leave", description="Leave an opt-in server weather alert role.")
+    async def weather_role_leave(self, inter: discord.Interaction, category: str): await self._change_weather_role(inter,category,False)
+
+    async def _send_server_weather_post(self,row:Dict[str,Any]):
+        async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
+            days=7 if row['cadence']=='weekly' else 2
+            outlook=await _fetch_outlook(session,row['latitude'],row['longitude'],days,row['timezone'],row['units'])
+            try: air=await _fetch_air_quality(session,row['latitude'],row['longitude'],row['timezone']) if row.get('include_air') else None
+            except Exception: air=None
+        emb=discord.Embed(title=("📅 Weekly Weather Outlook" if row['cadence']=='weekly' else "🌤️ Daily Weather Briefing")+f" — {row['location_name']}",description=_weather_briefing(row['location_name'],outlook,row['units'],air),colour=discord.Colour.blurple(),timestamp=datetime.now(timezone.utc))
+        for d,line,*_ in outlook[:7]: emb.add_field(name=datetime.fromisoformat(d).strftime('%A, %b %d'),value=line,inline=False)
+        if air:
+            aqi=air['current'].get('us_aqi'); label,_=_aqi_label(aqi); pollen=[f"{k.replace('_pollen','').title()}: {_pollen_level(v)}" for k,v in air['pollen'].items() if v is not None]
+            emb.add_field(name="Air quality",value=f"US AQI **{round(aqi) if aqi is not None else '—'}** · {label}",inline=True)
+            emb.add_field(name="Pollen",value="\n".join(pollen[:6]) or "Unavailable",inline=True)
+        channel=self.bot.get_channel(int(row['channel_id'])) or await self.bot.fetch_channel(int(row['channel_id'])); await channel.send(embed=emb)
+
+    @tasks.loop(minutes=1)
+    async def server_weather_scheduler(self):
+        now=datetime.now(timezone.utc)
+        for row in self.store.list_server_weather_posts(due_before=now.isoformat(),enabled_only=True):
+            try:
+                await self._send_server_weather_post(row)
+                nxt=_server_next_run(row['timezone'],row['hh'],row['mi'],row['cadence'],row['weekly_day'])
+                self.store.update_server_weather_post(row['id'],next_run_utc=nxt.isoformat(),last_sent_at=now.isoformat(),last_error=None); self.store.record_event('server_weather_post',row['created_by'],row['guild_id'])
+            except Exception as exc:
+                self.store.update_server_weather_post(row['id'],last_error=str(exc)[:300],next_run_utc=(now+timedelta(minutes=15)).isoformat()); self.store.record_event('server_weather_error',row['created_by'],row['guild_id'])
+
+    @server_weather_scheduler.before_loop
+    async def before_server_weather(self): await self.bot.wait_until_ready()
+
     def owner_analytics_embed(self) -> discord.Embed:
         stats = self.store.analytics_summary(); today = stats["events_today"]
         emb = discord.Embed(title="🌦️ Weather Bot Owner Analytics", description=f"Version **{BOT_VERSION}**", colour=discord.Colour.blurple(), timestamp=datetime.now(timezone.utc))
@@ -945,6 +1156,23 @@ class Weather(commands.Cog):
                     for a in fresh[:10]: emb.add_field(name=f"{a.get('event','Alert')} ({a.get('severity','Unknown')})",value=(a.get('headline') or a.get('description') or 'Details unavailable')[:1000],inline=False)
                     user=self.bot.get_user(uid) or await self.bot.fetch_user(uid); await user.send(embed=emb)
                     for a in fresh:self.store.set_note(uid,f"seen_alert:{a.get('id') or a.get('@id')}",datetime.now(timezone.utc).isoformat())
+                except Exception: continue
+            # Server role alerts use the same NWS source and are deduplicated per guild.
+            for cfg in self.store.list_weather_role_configs(enabled_only=True):
+                try:
+                    alerts=await self._fetch_nws_alerts(session,cfg["latitude"],cfg["longitude"]); fresh=[]
+                    order={"minor":0,"moderate":1,"severe":2,"extreme":3}; minimum=order.get((cfg.get("min_severity") or "moderate").lower(),1)
+                    for a in alerts:
+                        aid=a.get("id") or a.get("@id"); sev=(a.get("severity") or "minor").lower()
+                        if aid and order.get(sev,0)>=minimum and not self.store.server_alert_seen(cfg["guild_id"],aid): fresh.append(a)
+                    if not fresh: continue
+                    channel=self.bot.get_channel(int(cfg["channel_id"])) or await self.bot.fetch_channel(int(cfg["channel_id"]))
+                    for a in fresh[:10]:
+                        category=_alert_category(a.get("event")); rid=cfg.get(f"{category}_role_id") or cfg.get("storm_role_id"); mention=f"<@&{rid}>" if rid else None
+                        emb=discord.Embed(title=f"⚠️ {a.get('event','Weather Alert')} — {cfg['location_name']}",description=(a.get("headline") or a.get("description") or "Details unavailable")[:4000],colour=discord.Colour.orange())
+                        emb.add_field(name="Severity",value=a.get("severity","Unknown"),inline=True); emb.add_field(name="Category",value=category.title(),inline=True)
+                        await channel.send(content=mention,embed=emb,allowed_mentions=discord.AllowedMentions(roles=True))
+                        self.store.mark_server_alert_seen(cfg["guild_id"],a.get("id") or a.get("@id")); self.store.record_event("server_weather_alert",guild_id=cfg["guild_id"])
                 except Exception: continue
 
     @wx_alerts_scheduler.before_loop
