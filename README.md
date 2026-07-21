@@ -13,6 +13,12 @@ A Dockerized Discord weather bot with international location search, personal an
 - US National Weather Service alert DMs
 - SQLite storage with automatic migration of the previous ZIP/DM subscription schema
 
+## Version 2.3.3 radar remove fix
+
+- Fixed the radar **Remove** button for ephemeral radar panels.
+- The button now deletes the original interaction response through Discord's webhook API, with a safe close-panel fallback.
+- Retains the v2.3.2 radar briefing location fix.
+
 ## Version 2.3.2 radar briefing fix
 
 The **Briefing** button on radar panels now reuses the radar panel's already-resolved coordinates instead of trying to geocode its formatted display name again. Radar briefings now open reliably and remain private to the user.

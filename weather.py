@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.3.2"
+BOT_VERSION = "2.3.3"
 
 
 
@@ -763,12 +763,34 @@ class RadarView(discord.ui.View):
 
     @discord.ui.button(label="Remove", emoji="🗑️", style=discord.ButtonStyle.danger, row=0)
     async def remove(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        if not interaction.response.is_done():
-            await interaction.response.defer()
+        # Component interactions on ephemeral responses are most reliably removed
+        # through the interaction webhook rather than Message.delete().
         try:
-            await interaction.message.delete()
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            await interaction.delete_original_response()
+            self.stop()
+            return
         except Exception:
-            await interaction.message.edit(content="Radar closed.", embed=None, attachments=[], view=None)
+            pass
+
+        # Fallback for clients/messages Discord will not let us delete outright.
+        try:
+            await interaction.edit_original_response(
+                content="Radar closed.",
+                embed=None,
+                attachments=[],
+                view=None,
+            )
+        except Exception:
+            if interaction.message is not None:
+                await interaction.message.edit(
+                    content="Radar closed.",
+                    embed=None,
+                    attachments=[],
+                    view=None,
+                )
+        self.stop()
 
     @discord.ui.select(
         placeholder="Change radar range…",
