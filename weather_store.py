@@ -66,7 +66,8 @@ class WxStore:
             ("condition_metric", "TEXT"), ("condition_operator", "TEXT"), ("condition_value", "REAL"),
             ("condition_unit", "TEXT"), ("enabled", "INTEGER NOT NULL DEFAULT 1"),
             ("failure_count", "INTEGER NOT NULL DEFAULT 0"), ("last_error", "TEXT"),
-            ("last_result", "TEXT"), ("last_sent_at", "TEXT"), ("report_type", "TEXT NOT NULL DEFAULT 'forecast'")
+            ("last_result", "TEXT"), ("last_sent_at", "TEXT"), ("report_type", "TEXT NOT NULL DEFAULT 'forecast'"),
+            ("display_style", "TEXT NOT NULL DEFAULT 'automatic'")
         ]:
             self._add_column("weather_subs", name, definition)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_weather_subs_next ON weather_subs(next_run_utc)")
@@ -228,8 +229,8 @@ class WxStore:
 
     # Subscriptions
     def add_weather_sub(self, sub: Dict[str, Any]) -> int:
-        fields = ["user_id","zip","cadence","hh","mi","weekly_days","tz_name","units","next_run_utc","location_id","location_name","latitude","longitude","country_code","destination_type","guild_id","channel_id","created_by","condition_metric","condition_operator","condition_value","condition_unit","enabled","report_type"]
-        vals = [(sub.get(f) if f != "report_type" else (sub.get(f) or "forecast")) for f in fields]
+        fields = ["user_id","zip","cadence","hh","mi","weekly_days","tz_name","units","next_run_utc","location_id","location_name","latitude","longitude","country_code","destination_type","guild_id","channel_id","created_by","condition_metric","condition_operator","condition_value","condition_unit","enabled","report_type","display_style"]
+        vals = [((sub.get(f) or "forecast") if f == "report_type" else (sub.get(f) or "automatic") if f == "display_style" else sub.get(f)) for f in fields]
         vals[0] = int(vals[0]); vals[1] = str(vals[1] or "")
         cur = self.db.execute(f"INSERT INTO weather_subs({','.join(fields)}) VALUES({','.join('?' for _ in fields)})", vals)
         self.db.commit(); return int(cur.lastrowid)

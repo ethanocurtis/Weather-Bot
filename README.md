@@ -218,6 +218,9 @@ Administrators with **Manage Server** can schedule polished forecast briefings i
 
 The creation command accepts `daily` or `weekly`, a local delivery time, a destination channel, and an optional location. Weekly days use `0` for Monday through `6` for Sunday. Reports include a forecast briefing, daily outlook rows, air quality, and pollen when available.
 
+### Outlook display styles
+Forecast subscriptions can use **Automatic**, **Expanded**, or **Condensed** layouts. Automatic keeps detailed one-day cards for 1–2 forecast days and switches to one compact, scroll-friendly embed for 3 or more days. Condensed outlooks use the hottest forecast high for the embed accent color.
+
 ### Opt-in weather roles
 
 Use `/weather_roles_setup` to connect optional server roles to US National Weather Service alerts. Supported categories are:
@@ -303,6 +306,13 @@ Both standard and metric unit preferences are supported.
 - Moved the precipitation forecast interpretation to the bottom of current-weather embeds.
 - Renamed **Forecast Note** to **Forecast Summary** for a clearer, more intentional layout.
 - Current observations and detailed metrics now remain grouped together without interruption.
+
+## v2.5.1
+
+- Added **Automatic**, **Expanded**, and **Condensed** forecast outlook display styles.
+- Automatic mode uses expanded day cards for 1–2 days and one condensed embed for 3 or more days.
+- Added display-style selection to the guided subscription wizard and `/weather_subscribe_advanced`.
+- Condensed outlooks use the hottest forecast high for the embed accent color.
 
 ## v2.5.0
 

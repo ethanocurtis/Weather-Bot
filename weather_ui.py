@@ -90,12 +90,15 @@ class SubscriptionDraft:
     condition_operator: Optional[str] = None
     condition_value: Optional[float] = None
     report_type: str = "forecast"
+    display_style: str = "automatic"
 
 
 def wizard_embed(title: str, description: str, state: SubscriptionDraft) -> discord.Embed:
     embed = discord.Embed(title=f"🔔 Subscription Setup — {title}", description=description, colour=discord.Colour.blurple())
     details = []
     details.append(f"**Report:** {'Plain-language briefing' if state.report_type == 'briefing' else 'Forecast outlook'}")
+    if state.report_type == "forecast":
+        details.append(f"**Display:** {state.display_style.title()}")
     if state.destination_type:
         details.append(f"**Destination:** {state.channel_mention if state.destination_type == 'channel' else 'My DMs'}")
     if state.location:
@@ -295,10 +298,41 @@ class ScheduleModal(discord.ui.Modal, title="Choose delivery time"):
             if not 3 <= weekly_days <= 10:
                 raise ValueError("Weekly forecast days must be between 3 and 10.")
             self.state.hh, self.state.mi, self.state.weekly_days = hh, mi, weekly_days
-            embed = wizard_embed("When should it send?", "Choose whether the report always sends or only sends when a threshold is met.", self.state)
-            await interaction.response.edit_message(embed=embed, view=ConditionView(self.cog, self.state))
+            if self.state.report_type == "forecast":
+                embed = wizard_embed(
+                    "Choose a display style",
+                    "Automatic uses expanded cards for 1–2 days and a condensed layout for 3 or more days.",
+                    self.state,
+                )
+                await interaction.response.edit_message(embed=embed, view=DisplayStyleView(self.cog, self.state))
+            else:
+                embed = wizard_embed("When should it send?", "Choose whether the report always sends or only sends when a threshold is met.", self.state)
+                await interaction.response.edit_message(embed=embed, view=ConditionView(self.cog, self.state))
         except Exception as exc:
             await interaction.response.send_message(f"⚠️ {exc}", ephemeral=True)
+
+
+class DisplayStyleView(OwnedView):
+    def __init__(self, cog, state: SubscriptionDraft):
+        super().__init__(state.user_id)
+        self.cog, self.state = cog, state
+
+    async def choose(self, interaction: discord.Interaction, style: str):
+        self.state.display_style = style
+        embed = wizard_embed("When should it send?", "Choose whether the report always sends or only sends when a threshold is met.", self.state)
+        await interaction.response.edit_message(embed=embed, view=ConditionView(self.cog, self.state))
+
+    @discord.ui.button(label="Automatic", emoji="✨", style=discord.ButtonStyle.success)
+    async def automatic(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.choose(interaction, "automatic")
+
+    @discord.ui.button(label="Expanded", emoji="📖", style=discord.ButtonStyle.primary)
+    async def expanded(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.choose(interaction, "expanded")
+
+    @discord.ui.button(label="Condensed", emoji="📋", style=discord.ButtonStyle.secondary)
+    async def condensed(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.choose(interaction, "condensed")
 
 
 class ConditionView(OwnedView):

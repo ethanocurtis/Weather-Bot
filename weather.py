@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.5.0"
+BOT_VERSION = "2.5.1"
 
 
 
@@ -952,7 +952,7 @@ class Weather(commands.Cog):
             "country_code": loc.get("country_code"), "destination_type": state.destination_type,
             "guild_id": state.guild_id, "channel_id": state.channel_id, "created_by": state.user_id,
             "condition_metric": state.condition_metric, "condition_operator": state.condition_operator,
-            "condition_value": state.condition_value, "condition_unit": _get_user_units(self.store, state.user_id), "enabled": 1, "report_type": state.report_type,
+            "condition_value": state.condition_value, "condition_unit": _get_user_units(self.store, state.user_id), "enabled": 1, "report_type": state.report_type, "display_style": state.display_style,
         }
         return self.store.add_weather_sub(sub), first
 
@@ -1607,7 +1607,7 @@ class Weather(commands.Cog):
 
     @app_commands.command(name="weather_subscribe_advanced", description="Create a subscription using advanced command options.")
     @app_commands.describe(time="Delivery time, such as 7:00 AM", cadence="daily or weekly", location="City, place, postal code, or saved default", destination="dm or channel", channel="Required for channel delivery", weekly_days="Number of forecast days for weekly reports", metric="max_wind, max_temp, min_temp, rain_chance, precipitation, or uv", operator=">, >=, <, or <=", threshold="Only send when this condition matches")
-    async def weather_subscribe_advanced(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, report_type: str="forecast", metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
+    async def weather_subscribe_advanced(self, inter: discord.Interaction, time: str, cadence: str="daily", location: Optional[str]=None, destination: str="dm", channel: Optional[discord.TextChannel]=None, weekly_days: app_commands.Range[int,3,10]=7, report_type: str="forecast", display_style: str="automatic", metric: Optional[str]=None, operator: Optional[str]=None, threshold: Optional[float]=None):
         await inter.response.defer(ephemeral=True)
         try:
             cadence=cadence.lower(); destination=destination.lower()
@@ -1615,6 +1615,8 @@ class Weather(commands.Cog):
             if destination not in {"dm","channel"}: raise ValueError("Destination must be dm or channel.")
             report_type=report_type.lower()
             if report_type not in {"forecast","briefing"}: raise ValueError("Report type must be forecast or briefing.")
+            display_style=display_style.lower()
+            if display_style not in {"automatic","expanded","condensed"}: raise ValueError("Display style must be automatic, expanded, or condensed.")
             if destination=="channel":
                 if not inter.guild or not channel: raise ValueError("Choose a server channel.")
                 if not inter.user.guild_permissions.manage_guild: raise ValueError("Manage Server permission is required.")
@@ -1625,7 +1627,7 @@ class Weather(commands.Cog):
             hh,mi=_parse_time(time)
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session: loc=await self._resolve_location(session,inter.user.id,location)
             tz_name=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id); first=_next_local_run(datetime.now(_tzinfo_from_name(tz_name)),hh,mi,cadence)
-            sub={"user_id":inter.user.id,"zip":"","cadence":cadence,"hh":hh,"mi":mi,"weekly_days":weekly_days,"tz_name":tz_name,"units":_get_user_units(self.store,inter.user.id),"next_run_utc":first.astimezone(timezone.utc).isoformat(),"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"destination_type":destination,"guild_id":inter.guild.id if destination=="channel" else None,"channel_id":channel.id if channel else None,"created_by":inter.user.id,"condition_metric":metric,"condition_operator":operator,"condition_value":threshold,"condition_unit":_get_user_units(self.store,inter.user.id),"enabled":1,"report_type":report_type}
+            sub={"user_id":inter.user.id,"zip":"","cadence":cadence,"hh":hh,"mi":mi,"weekly_days":weekly_days,"tz_name":tz_name,"units":_get_user_units(self.store,inter.user.id),"next_run_utc":first.astimezone(timezone.utc).isoformat(),"location_name":loc["display_name"],"latitude":loc["latitude"],"longitude":loc["longitude"],"country_code":loc.get("country_code"),"destination_type":destination,"guild_id":inter.guild.id if destination=="channel" else None,"channel_id":channel.id if channel else None,"created_by":inter.user.id,"condition_metric":metric,"condition_operator":operator,"condition_value":threshold,"condition_unit":_get_user_units(self.store,inter.user.id),"enabled":1,"report_type":report_type,"display_style":display_style}
             sid=self.store.add_weather_sub(sub); condition=f" only when `{metric} {operator} {threshold}`" if metric else ""
             await inter.followup.send(f"✅ Subscription **#{sid}** created for **{loc['display_name']}**, delivered to **{channel.mention if channel else 'DM'}**{condition}. Next evaluation: {first.strftime('%Y-%m-%d %I:%M %p %Z')}",ephemeral=True)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
@@ -1726,7 +1728,65 @@ class Weather(commands.Cog):
             parts.append("Breezy to windy conditions are possible.")
         return " ".join(parts)
 
+    def _condensed_outlook_embed(self, sub, outlook):
+        units = sub.get("units") or "standard"
+        temp_unit = "°F" if units == "standard" else "°C"
+        wind_unit = "mph" if units == "standard" else "km/h"
+        location = sub.get("location_name") or sub.get("zip") or "Saved location"
+        tz_name = sub.get("tz_name") or DEFAULT_TZ_NAME
+        today = datetime.now(_tzinfo_from_name(tz_name)).date()
+        sections = []
+        hottest = None
+
+        for row in outlook:
+            d, line, sunrise, sunset, uv, *rest = row
+            metrics = rest[1] if len(rest) > 1 else (rest[0] if rest and isinstance(rest[0], dict) else {})
+            high = metrics.get("max_temp")
+            low = metrics.get("min_temp")
+            rain = metrics.get("rain_chance")
+            wind = metrics.get("max_wind")
+            condition = metrics.get("condition") or "Forecast"
+            code = metrics.get("weather_code")
+            icon, _ = wx_icon_desc(code) if code is not None else ("🌤️", condition)
+            if high is not None:
+                hottest = float(high) if hottest is None else max(hottest, float(high))
+            try:
+                date_obj = datetime.fromisoformat(str(d)).date()
+                delta = (date_obj - today).days
+                day_name = "Today" if delta == 0 else "Tomorrow" if delta == 1 else date_obj.strftime("%A")
+                date_label = date_obj.strftime("%b %-d")
+            except Exception:
+                day_name, date_label = str(d), str(d)
+
+            temp_bits = []
+            if high is not None: temp_bits.append(f"**{round(high)}{temp_unit}**")
+            if low is not None: temp_bits.append(f"**{round(low)}{temp_unit}**")
+            temp_text = " / ".join(temp_bits) if temp_bits else "Temperatures unavailable"
+            detail_bits = []
+            if rain is not None: detail_bits.append(f"🌧️ {round(rain)}%")
+            if wind is not None: detail_bits.append(f"💨 {round(wind)} {wind_unit}")
+            if uv is not None: detail_bits.append(f"☀️ UV {round(uv,1)}")
+            details = " · ".join(detail_bits)
+            sections.append(
+                f"**{icon} {day_name} · {date_label}**\n"
+                f"{condition} · 🌡️ {temp_text}"
+                + (f"\n{details}" if details else "")
+            )
+
+        title_prefix = "Daily Outlook" if sub.get("cadence") == "daily" else f"{len(outlook)}-Day Outlook"
+        emb = discord.Embed(
+            title=f"🌤️ {title_prefix} — {location}",
+            description="\n\n".join(sections),
+            colour=self._temperature_colour(hottest, units),
+        )
+        emb.set_footer(text=f"Condensed view • Scheduled in {tz_name} • Units: {units}")
+        return emb
+
     def _outlook_embeds(self, sub, outlook):
+        style = (sub.get("display_style") or "automatic").lower()
+        use_condensed = style == "condensed" or (style == "automatic" and len(outlook) >= 3)
+        if use_condensed:
+            return [self._condensed_outlook_embed(sub, outlook)]
         units = sub.get("units") or "standard"
         temp_unit = "°F" if units == "standard" else "°C"
         wind_unit = "mph" if units == "standard" else "km/h"
