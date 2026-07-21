@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.4.3"
+BOT_VERSION = "2.5.0"
 
 
 
@@ -521,7 +521,7 @@ class StickyWeatherView(discord.ui.View):
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
                 outlook = await _fetch_outlook(session, row["latitude"], row["longitude"], 7, row["timezone"], row["units"])
             sub={"cadence":"weekly","location_name":row["location_name"],"tz_name":row["timezone"],"units":row["units"]}
-            await interaction.followup.send(embed=self.cog._outlook_embed(sub, outlook), ephemeral=True)
+            await interaction.followup.send(embeds=self.cog._outlook_embeds(sub, outlook), ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"⚠️ Could not load the 7-day forecast: {exc}", ephemeral=True)
 
@@ -980,14 +980,20 @@ class Weather(commands.Cog):
             embed = self._briefing_embed(sub, outlook, air)
             embed.description = "**Test delivery** — this does not affect the next scheduled run.\n\n" + (embed.description or "")
         else:
-            embed = self._outlook_embed(sub, outlook)
-            embed.description = "**Test delivery** — this does not affect the next scheduled run."
+            embeds = self._outlook_embeds(sub, outlook)
+            embeds[0].description = "**Test delivery** — this does not affect the next scheduled run.\n\n" + (embeds[0].description or "")
         if sub.get("destination_type") == "channel":
             channel = self.bot.get_channel(int(sub["channel_id"])) or await self.bot.fetch_channel(int(sub["channel_id"]))
-            await channel.send(embed=embed)
+            if sub.get("report_type", "forecast") == "briefing":
+                await channel.send(embed=embed)
+            else:
+                await channel.send(embeds=embeds)
             return channel.mention
         target = self.bot.get_user(int(sub["user_id"])) or await self.bot.fetch_user(int(sub["user_id"]))
-        await target.send(embed=embed)
+        if sub.get("report_type", "forecast") == "briefing":
+            await target.send(embed=embed)
+        else:
+            await target.send(embeds=embeds)
         return "your DMs"
 
     async def _resolve_location(self, session, user_id: int, query: Optional[str] = None) -> Dict[str, Any]:
@@ -1686,17 +1692,94 @@ class Weather(commands.Cog):
         matched={">":actual>target,">=":actual>=target,"<":actual<target,"<=":actual<=target}[op]
         return matched,f"{metric} was {actual:g}; required {op} {target:g}"
 
+    def _temperature_colour(self, temp: Optional[float], units: str) -> discord.Colour:
+        if temp is None:
+            return discord.Colour.blurple()
+        temp_f = float(temp) if units == "standard" else (float(temp) * 9 / 5 + 32)
+        if temp_f >= 100: return discord.Colour.from_rgb(220, 45, 45)
+        if temp_f >= 90: return discord.Colour.from_rgb(239, 105, 44)
+        if temp_f >= 80: return discord.Colour.from_rgb(245, 166, 35)
+        if temp_f >= 70: return discord.Colour.from_rgb(241, 196, 15)
+        if temp_f >= 60: return discord.Colour.from_rgb(111, 191, 115)
+        if temp_f >= 50: return discord.Colour.from_rgb(54, 162, 235)
+        if temp_f >= 35: return discord.Colour.from_rgb(72, 120, 210)
+        return discord.Colour.from_rgb(126, 87, 194)
+
+    def _outlook_summary(self, metrics: Dict[str, Any], units: str) -> str:
+        condition = str(metrics.get("condition") or "Conditions unavailable")
+        high = metrics.get("max_temp")
+        low = metrics.get("min_temp")
+        rain = metrics.get("rain_chance")
+        wind = metrics.get("max_wind")
+        parts = [condition.rstrip(".") + "."]
+        if high is not None and low is not None:
+            spread = float(high) - float(low)
+            if float(high) >= (95 if units == "standard" else 35):
+                parts.append("Very hot conditions are expected.")
+            elif spread >= (20 if units == "standard" else 11):
+                parts.append("Expect a noticeable temperature swing through the day.")
+        if rain is not None:
+            if float(rain) >= 70: parts.append("Rain is likely.")
+            elif float(rain) >= 40: parts.append("Rain is possible.")
+            elif float(rain) >= 20: parts.append("A few showers are possible.")
+        if wind is not None and float(wind) >= (25 if units == "standard" else 40):
+            parts.append("Breezy to windy conditions are possible.")
+        return " ".join(parts)
+
+    def _outlook_embeds(self, sub, outlook):
+        units = sub.get("units") or "standard"
+        temp_unit = "°F" if units == "standard" else "°C"
+        wind_unit = "mph" if units == "standard" else "km/h"
+        precip_unit = "inch" if units == "standard" else "mm"
+        location = sub.get("location_name") or sub.get("zip") or "Saved location"
+        embeds=[]
+        for index, row in enumerate(outlook):
+            d,line,sunrise,sunset,uv,*rest = row
+            metrics = rest[1] if len(rest) > 1 else (rest[0] if rest and isinstance(rest[0], dict) else {})
+            high = metrics.get("max_temp")
+            low = metrics.get("min_temp")
+            rain = metrics.get("rain_chance")
+            precip = metrics.get("precipitation")
+            wind = metrics.get("max_wind")
+            condition = metrics.get("condition") or "Forecast"
+            code = metrics.get("weather_code")
+            icon,_ = wx_icon_desc(code) if code is not None else ("🌤️", condition)
+            try:
+                date_obj = datetime.fromisoformat(str(d)).date()
+                today = datetime.now(_tzinfo_from_name(sub.get("tz_name") or DEFAULT_TZ_NAME)).date()
+                delta = (date_obj - today).days
+                day_name = "Today" if delta == 0 else "Tomorrow" if delta == 1 else date_obj.strftime("%A")
+                date_label = date_obj.strftime("%a, %b %-d")
+            except Exception:
+                day_name, date_label = str(d), str(d)
+            title_prefix = "Daily Outlook" if sub.get("cadence") == "daily" else "Weekly Outlook"
+            title = f"{title_prefix} — {location}" if index == 0 else f"{icon} {day_name}"
+            emb = discord.Embed(
+                title=title,
+                description=(f"**{icon} {day_name} ({date_label})**\n{self._outlook_summary(metrics, units)}" if index == 0 else f"**{date_label}**\n{self._outlook_summary(metrics, units)}"),
+                colour=self._temperature_colour(high, units),
+            )
+            if high is not None or low is not None:
+                temp_bits=[]
+                if high is not None: temp_bits.append(f"🔥 High **{round(high)}{temp_unit}**")
+                if low is not None: temp_bits.append(f"❄️ Low **{round(low)}{temp_unit}**")
+                emb.add_field(name="🌡️ Temperature", value=" • ".join(temp_bits), inline=False)
+            precip_bits=[]
+            if rain is not None: precip_bits.append(f"**{round(rain)}%** chance")
+            if precip is not None and float(precip) > 0: precip_bits.append(f"up to **{precip:.2f} {precip_unit}**")
+            if precip_bits: emb.add_field(name="🌧️ Precipitation", value=" • ".join(precip_bits), inline=True)
+            if wind is not None: emb.add_field(name="💨 Wind", value=f"Up to **{round(wind)} {wind_unit}**", inline=True)
+            if uv is not None: emb.add_field(name="☀️ UV Index", value=f"**{round(uv,1)}**", inline=True)
+            sun=[]
+            if sunrise: sun.append(f"🌅 {fmt_sun(sunrise)}")
+            if sunset: sun.append(f"🌇 {fmt_sun(sunset)}")
+            if sun: emb.add_field(name="Sun", value=" • ".join(sun), inline=False)
+            emb.set_footer(text=f"Scheduled in {sub.get('tz_name') or DEFAULT_TZ_NAME} • Units: {units}")
+            embeds.append(emb)
+        return embeds
+
     def _outlook_embed(self, sub, outlook):
-        title=("Daily" if sub["cadence"]=="daily" else "Weekly")+f" Outlook — {sub.get('location_name') or sub.get('zip')}"
-        emb=discord.Embed(title=title,colour=discord.Colour.blurple())
-        for d,line,sunrise,sunset,uv,*_ in outlook:
-            extras=[]
-            if sunrise: extras.append(f"🌅 {fmt_sun(sunrise)}")
-            if sunset: extras.append(f"🌇 {fmt_sun(sunset)}")
-            if uv is not None: extras.append(f"🔆 UV {round(uv,1)}")
-            emb.add_field(name=d,value=line+("\n"+" · ".join(extras) if extras else ""),inline=False)
-        emb.set_footer(text=f"Scheduled in {sub['tz_name']} • Units: {sub['units']}")
-        return emb
+        return self._outlook_embeds(sub, outlook)[0]
 
     @tasks.loop(seconds=60)
     async def weather_scheduler(self):
@@ -1719,11 +1802,15 @@ class Weather(commands.Cog):
                             except Exception: air=None
                             emb=self._briefing_embed(s,outlook,air)
                         else:
-                            emb=self._outlook_embed(s,outlook)
+                            embeds=self._outlook_embeds(s,outlook)
                         if s.get("destination_type")=="channel":
-                            ch=self.bot.get_channel(int(s["channel_id"])) or await self.bot.fetch_channel(int(s["channel_id"])); await ch.send(embed=emb)
+                            ch=self.bot.get_channel(int(s["channel_id"])) or await self.bot.fetch_channel(int(s["channel_id"]))
+                            if s.get("report_type", "forecast") == "briefing": await ch.send(embed=emb)
+                            else: await ch.send(embeds=embeds)
                         else:
-                            user=self.bot.get_user(int(s["user_id"])) or await self.bot.fetch_user(int(s["user_id"])); await user.send(embed=emb)
+                            user=self.bot.get_user(int(s["user_id"])) or await self.bot.fetch_user(int(s["user_id"]))
+                            if s.get("report_type", "forecast") == "briefing": await user.send(embed=emb)
+                            else: await user.send(embeds=embeds)
                     tz=_tzinfo_from_name(s.get("tz_name") or DEFAULT_TZ_NAME); nxt=datetime.now(tz).replace(hour=int(s["hh"]),minute=int(s["mi"]),second=0,microsecond=0)+timedelta(days=1 if s["cadence"]=="daily" else 7)
                     self.store.update_weather_sub(s["id"],nxt.astimezone(timezone.utc).isoformat(),failure_count=0,last_error=None,last_result=("sent: " if matched else "not sent: ")+result,last_sent_at=now.isoformat() if matched else s.get("last_sent_at"))
                     self.store.record_event("scheduled_sent" if matched else "scheduled_skipped", s.get("user_id"), s.get("guild_id"))

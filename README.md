@@ -303,3 +303,10 @@ Both standard and metric unit preferences are supported.
 - Moved the precipitation forecast interpretation to the bottom of current-weather embeds.
 - Renamed **Forecast Note** to **Forecast Summary** for a clearer, more intentional layout.
 - Current observations and detailed metrics now remain grouped together without interruption.
+
+## v2.5.0
+
+- Redesigned scheduled Daily and Weekly Outlooks into cleaner, easy-to-scan day cards.
+- Added plain-language daily summaries with relative day labels such as Today and Tomorrow.
+- Separated temperature, precipitation, wind, UV, and sun times into readable sections.
+- Each day's Discord embed accent bar now changes color based on that day's forecast high temperature.
