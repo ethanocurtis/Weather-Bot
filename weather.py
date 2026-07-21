@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.3.1"
+BOT_VERSION = "2.3.2"
 
 
 
@@ -807,7 +807,11 @@ class RadarView(discord.ui.View):
 
     @discord.ui.button(label="Briefing", emoji="📝", style=discord.ButtonStyle.secondary, row=2)
     async def briefing(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await self.cog._send_briefing_command(interaction, self.location.get("display_name"))
+        await self.cog._send_briefing_command(
+            interaction,
+            resolved_location=self.location,
+            ephemeral=True,
+        )
 
 class Weather(commands.Cog):
     """Weather, locations, subscriptions, alerts, and feedback tracking."""
@@ -1257,7 +1261,7 @@ class Weather(commands.Cog):
                 loc=await self._resolve_location(session,inter.user.id,location)
                 tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id)
                 emb=await self._current_embed(session,loc,_get_user_units(self.store,inter.user.id),tz)
-            await inter.followup.send(embed=emb)
+            await inter.followup.send(embed=emb, ephemeral=ephemeral)
             self.store.record_event("weather_lookup", inter.user.id, inter.guild.id if inter.guild else None)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
 
@@ -1447,11 +1451,21 @@ class Weather(commands.Cog):
             self.store.record_event("air_quality_lookup",inter.user.id,inter.guild.id if inter.guild else None)
         except Exception as exc: await inter.followup.send(f"⚠️ Could not load air quality: {exc}")
 
-    async def _send_briefing_command(self, inter: discord.Interaction, location: Optional[str] = None):
-        await inter.response.defer()
+    async def _send_briefing_command(
+        self,
+        inter: discord.Interaction,
+        location: Optional[str] = None,
+        resolved_location: Optional[Dict[str, Any]] = None,
+        ephemeral: bool = False,
+    ):
+        await inter.response.defer(ephemeral=ephemeral)
         try:
             async with aiohttp.ClientSession(headers=HTTP_HEADERS) as session:
-                loc = await self._resolve_location(session, inter.user.id, location)
+                loc = dict(resolved_location) if resolved_location is not None else await self._resolve_location(
+                    session,
+                    inter.user.id,
+                    location,
+                )
                 units = _get_user_units(self.store, inter.user.id)
                 tz = loc.get("timezone") or _get_user_tz_name(self.store, inter.user.id)
                 outlook = await _fetch_outlook(session, float(loc["latitude"]), float(loc["longitude"]), 2, tz, units)
@@ -1466,10 +1480,10 @@ class Weather(commands.Cog):
                 colour=wx_color_from_temp_f(temp_f),
                 timestamp=datetime.now(timezone.utc),
             )
-            await inter.followup.send(embed=emb)
+            await inter.followup.send(embed=emb, ephemeral=ephemeral)
             self.store.record_event("weather_briefing", inter.user.id, inter.guild.id if inter.guild else None)
         except Exception as exc:
-            await inter.followup.send(f"⚠️ Could not create the briefing: {exc}")
+            await inter.followup.send(f"⚠️ Could not create the briefing: {exc}", ephemeral=ephemeral)
 
     @app_commands.command(name="brief", description="Quick plain-language weather, air-quality, and pollen briefing.")
     async def brief_cmd(self, inter: discord.Interaction, location: Optional[str] = None):

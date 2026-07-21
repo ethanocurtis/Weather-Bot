@@ -13,6 +13,10 @@ A Dockerized Discord weather bot with international location search, personal an
 - US National Weather Service alert DMs
 - SQLite storage with automatic migration of the previous ZIP/DM subscription schema
 
+## Version 2.3.2 radar briefing fix
+
+The **Briefing** button on radar panels now reuses the radar panel's already-resolved coordinates instead of trying to geocode its formatted display name again. Radar briefings now open reliably and remain private to the user.
+
 ## Version 2.3.1 radar fixes
 
 Radar images now include a street-map basemap beneath the NOAA reflectivity layer. Range changes and refreshes update the same panel without re-geocoding the location, and the radar panel includes a **Remove** button.
