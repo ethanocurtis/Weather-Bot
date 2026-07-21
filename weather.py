@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.4.0"
+BOT_VERSION = "2.4.1"
 
 
 
@@ -235,7 +235,7 @@ async def _fetch_outlook(session: aiohttp.ClientSession, lat: float, lon: float,
             parts.append(f"\u2614 {int(pp)}%")
         parts.append(f"\U0001F4CF {pr:.2f} {precip_unit}")
         line = f"{icon} {desc} — " + " - ".join(parts)
-        out.append((d, line, sunrise, sunset, uv, hi, {"max_wind": wm, "max_temp": hi, "min_temp": lo, "rain_chance": pp, "precipitation": pr, "uv": uv}))
+        out.append((d, line, sunrise, sunset, uv, hi, {"max_wind": wm, "max_temp": hi, "min_temp": lo, "rain_chance": pp, "precipitation": pr, "uv": uv, "weather_code": code, "condition": desc}))
     return out
 
 
@@ -393,22 +393,65 @@ def _pollen_level(value: Optional[float]) -> str:
     return "Very high"
 
 
+def _precipitation_forecast_text(condition: str, weather_code: Optional[int], rain_chance: Optional[float]) -> Optional[str]:
+    """Build probability-aware precipitation wording without implying it is occurring now."""
+    code = int(weather_code) if weather_code is not None else -1
+    precip_codes = set(range(51, 58)) | set(range(61, 68)) | set(range(71, 78)) | set(range(80, 87)) | {95, 96, 99}
+    if code not in precip_codes:
+        return None
+
+    chance = round(float(rain_chance)) if rain_chance is not None else None
+    lower = (condition or "precipitation").lower()
+
+    if "thunder" in lower:
+        event = "thunderstorms"
+    elif "snow" in lower or code == 77:
+        event = "snow"
+    elif "freezing" in lower:
+        event = "freezing precipitation"
+    elif "drizzle" in lower:
+        event = "drizzle"
+    else:
+        event = "rain"
+
+    if chance is None:
+        lead = f"{condition} is possible today."
+    elif chance >= 70:
+        lead = f"{event.capitalize()} is likely today, with chances peaking near **{chance}%**."
+    elif chance >= 40:
+        lead = f"{event.capitalize()} is possible today, with chances peaking near **{chance}%**."
+    elif chance >= 20:
+        lead = f"A few periods of {event} are possible today, although the peak chance is only **{chance}%**."
+    else:
+        lead = f"There is only a slight chance of {event} today, peaking near **{chance}%**."
+
+    if code in {55, 57, 65, 67, 75, 81, 82, 86, 96, 99}:
+        if chance is not None and chance < 50:
+            lead += f" Many locations may stay dry, but any {event} that develops could be heavy."
+        else:
+            lead += f" Any {event} that develops may be heavy."
+    elif code in {95}:
+        lead += " Brief thunderstorms may occur where storms develop."
+    return lead
+
+
 def _weather_briefing(location_name: str, outlook: List[Tuple], units: str, air: Optional[Dict[str,Any]]=None) -> str:
     if not outlook: return f"No forecast is currently available for {location_name}."
     d,line,_,_,uv,hi,metrics=outlook[0]
-    icon, desc = wx_icon_desc(0)
-    # Pull description from the already formatted outlook line without exposing markup.
-    condition = re.sub(r"^\S+\s+", "", line).split(" — ",1)[0]
+    condition = metrics.get("condition") or re.sub(r"^\S+\s+", "", line).split(" — ",1)[0]
+    weather_code = metrics.get("weather_code")
     temp_unit = "°F" if units == "standard" else "°C"
     wind_unit = "mph" if units == "standard" else "km/h"
-    parts=[f"Expect **{condition.lower()}** in **{location_name}** today."]
+    rain=metrics.get("rain_chance")
+    precip_text = _precipitation_forecast_text(condition, weather_code, rain)
+    parts=[precip_text or f"Expect **{condition.lower()}** in **{location_name}** today."]
     if metrics.get("max_temp") is not None and metrics.get("min_temp") is not None:
         parts.append(f"Temperatures should range from **{round(metrics['min_temp'])}{temp_unit}** to **{round(metrics['max_temp'])}{temp_unit}**.")
-    rain=metrics.get("rain_chance")
-    if rain is not None:
+    if rain is not None and precip_text is None:
         if rain >= 70: parts.append(f"Rain is likely, with a peak chance near **{round(rain)}%**; plan for wet conditions.")
         elif rain >= 35: parts.append(f"There is a **{round(rain)}%** chance of rain, so keeping rain gear nearby would be sensible.")
-        else: parts.append(f"Rain is unlikely, with a peak chance near **{round(rain)}%**.")
+        elif rain >= 20: parts.append(f"A few showers are possible, with a peak chance near **{round(rain)}%**.")
+        else: parts.append(f"Dry conditions are favored, with rain chances peaking near **{round(rain)}%**.")
     wind=metrics.get("max_wind")
     if wind is not None:
         if wind >= (25 if units=='standard' else 40): parts.append(f"Winds may be strong, reaching about **{round(wind)} {wind_unit}**; secure loose outdoor items.")
@@ -1203,8 +1246,10 @@ class Weather(commands.Cog):
 
         cur = wx.get("current") or {}
         daily = wx.get("daily") or {}
-        code = (daily.get("weather_code") or [cur.get("weather_code", 0)])[0]
-        icon, desc = wx_icon_desc(code)
+        current_code = cur.get("weather_code", 0)
+        daily_code = (daily.get("weather_code") or [current_code])[0]
+        icon, desc = wx_icon_desc(current_code)
+        _daily_icon, daily_desc = wx_icon_desc(daily_code)
         temperature = cur.get("temperature_2m")
         apparent = cur.get("apparent_temperature", temperature)
         high = (daily.get("temperature_2m_max") or [None])[0]
@@ -1271,6 +1316,17 @@ class Weather(commands.Cog):
             value=f"Chance **{rain_chance}%**\nExpected **{rain_total} {precip_unit}**",
             inline=True,
         )
+
+        # Keep the headline strictly tied to current observations. Daily precipitation
+        # severity belongs in a clearly labeled forecast note so users do not read it
+        # as something happening at this moment.
+        forecast_note = _precipitation_forecast_text(daily_desc, daily_code, rain_chance if isinstance(rain_chance, (int, float)) else None)
+        if forecast_note:
+            embed.add_field(
+                name="📋 Forecast Note",
+                value=forecast_note.replace("**", ""),
+                inline=False,
+            )
 
         wind_speed = cur.get("wind_speed_10m", 0)
         wind_gust = cur.get("wind_gusts_10m", 0)

@@ -285,3 +285,9 @@ The `/weather` result and radar panel's Forecast button now include:
 - Local sunrise and sunset
 
 Both standard and metric unit preferences are supported.
+
+## v2.4.1
+
+- Live weather headlines now use the current observed weather code rather than the day's most severe forecast condition.
+- Added a separate forecast note when rain, snow, or storms are possible later in the day.
+- Briefings now combine precipitation probability with type and intensity, avoiding contradictory wording such as “heavy rain” followed by “rain unlikely.”
