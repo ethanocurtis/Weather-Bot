@@ -291,3 +291,10 @@ Both standard and metric unit preferences are supported.
 - Live weather headlines now use the current observed weather code rather than the day's most severe forecast condition.
 - Added a separate forecast note when rain, snow, or storms are possible later in the day.
 - Briefings now combine precipitation probability with type and intensity, avoiding contradictory wording such as “heavy rain” followed by “rain unlikely.”
+
+
+## v2.4.2
+
+- Moved the precipitation forecast interpretation to the bottom of current-weather embeds.
+- Renamed **Forecast Note** to **Forecast Summary** for a clearer, more intentional layout.
+- Current observations and detailed metrics now remain grouped together without interruption.

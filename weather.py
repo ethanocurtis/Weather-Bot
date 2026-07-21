@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.4.1"
+BOT_VERSION = "2.4.2"
 
 
 
@@ -1318,15 +1318,13 @@ class Weather(commands.Cog):
         )
 
         # Keep the headline strictly tied to current observations. Daily precipitation
-        # severity belongs in a clearly labeled forecast note so users do not read it
-        # as something happening at this moment.
-        forecast_note = _precipitation_forecast_text(daily_desc, daily_code, rain_chance if isinstance(rain_chance, (int, float)) else None)
-        if forecast_note:
-            embed.add_field(
-                name="📋 Forecast Note",
-                value=forecast_note.replace("**", ""),
-                inline=False,
-            )
+        # severity is summarized after the detailed weather fields so it does not
+        # interrupt the scan-friendly forecast layout.
+        forecast_note = _precipitation_forecast_text(
+            daily_desc,
+            daily_code,
+            rain_chance if isinstance(rain_chance, (int, float)) else None,
+        )
 
         wind_speed = cur.get("wind_speed_10m", 0)
         wind_gust = cur.get("wind_gusts_10m", 0)
@@ -1381,6 +1379,13 @@ class Weather(commands.Cog):
             value=f"Sunrise **{clock(sunrise)}**\nSunset **{clock(sunset)}**",
             inline=True,
         )
+
+        if forecast_note:
+            embed.add_field(
+                name="📝 Forecast Summary",
+                value=forecast_note.replace("**", ""),
+                inline=False,
+            )
 
         embed.set_footer(text=f"Open-Meteo • Units: {units} • Timezone: {tz_name}")
         return embed
