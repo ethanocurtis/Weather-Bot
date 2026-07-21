@@ -1,3 +1,11 @@
+
+## v2.5.2
+
+- Confirmed normal weather, location, forecast, radar, subscription, and personal-alert commands remain available to all users.
+- Server configuration commands continue to require **Manage Server** at runtime.
+- Owner analytics and request-status commands remain restricted to the configured bot owner.
+- Feedback, bug, and feature confirmations now direct users to GitHub Issues for screenshots, logs, and detailed troubleshooting.
+
 # Weather Bot v2.0.1
 
 A Dockerized Discord weather bot with international location search, personal and server forecasts, conditional reports, US NWS alerts, and trackable user feedback.

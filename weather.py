@@ -28,7 +28,9 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.5.1"
+BOT_VERSION = "2.5.2"
+GITHUB_REPO_URL = "https://github.com/ethanocurtis/Weather-Bot"
+GITHUB_ISSUES_URL = f"{GITHUB_REPO_URL}/issues"
 
 
 
@@ -1016,6 +1018,7 @@ class Weather(commands.Cog):
         emb.add_field(name="From", value=f"<@{req['user_id']}> (`{req['user_id']}`)", inline=True)
         emb.add_field(name="Context", value=req.get("guild_name") or "DM", inline=False)
         if req.get("staff_note"): emb.add_field(name="Staff note", value=req["staff_note"][:1024], inline=False)
+        emb.add_field(name="More details", value=f"For logs, screenshots, and longer reports: [Open GitHub Issues]({GITHUB_ISSUES_URL})", inline=False)
         return emb
 
     async def _send_feedback(self, inter: discord.Interaction, kind: str, message: str) -> int:
@@ -1057,7 +1060,11 @@ class Weather(commands.Cog):
         except RuntimeError as e:
             return await inter.followup.send("Please wait a minute before submitting another request." if str(e)=="cooldown" else "Feedback routing is not configured correctly.", ephemeral=True)
         except ValueError: return await inter.followup.send("Please include a message.", ephemeral=True)
-        await inter.followup.send(f"✅ Submitted as **#{rid}**. You’ll be notified when its status changes.", ephemeral=True)
+        await inter.followup.send(
+            f"✅ Submitted as **#{rid}**. You’ll be notified when its status changes.\n\n"
+            f"For screenshots, logs, or a more detailed report, please also use [GitHub Issues]({GITHUB_ISSUES_URL}) when possible.",
+            ephemeral=True,
+        )
 
     def get_user_units(self, user_id: int) -> str:
         return _get_user_units(self.store, user_id)

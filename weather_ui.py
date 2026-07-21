@@ -17,7 +17,7 @@ HELP_PAGES = {
     "sticky": ("📌 Sticky Dashboard", "Admins can create an automatically refreshed weather message with `/sticky_weather_create`, list dashboards with `/sticky_weather_list`, and delete one with `/sticky_weather_delete`."),
     "alerts": ("⚠️ Personal Alerts", "Use `/wx_alerts mode:on` for active US National Weather Service alerts by DM. NWS alerts require a saved US location."),
     "settings": ("⚙️ Settings", "`/units` changes standard or metric units, `/timezone` controls scheduling, and `/settings` reviews your preferences."),
-    "feedback": ("💬 Feedback & Requests", "Use `/feature`, `/bug`, or `/feedback`. `/my_requests` shows status updates. Owners can use `/request_update`."),
+    "feedback": ("💬 Feedback & Requests", "Use `/feature`, `/bug`, or `/feedback`. `/my_requests` shows status updates. For screenshots, logs, and detailed troubleshooting, please also use GitHub Issues when possible: https://github.com/ethanocurtis/Weather-Bot/issues. Owners can use `/request_update`."),
     "owner": ("📊 Owner Tools", "The configured bot owner can open `/owner_analytics` for live guild totals, stored usage totals, scheduler activity, and request counts."),
 }
 
