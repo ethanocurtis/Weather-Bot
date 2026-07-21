@@ -293,6 +293,11 @@ Both standard and metric unit preferences are supported.
 - Briefings now combine precipitation probability with type and intensity, avoiding contradictory wording such as “heavy rain” followed by “rain unlikely.”
 
 
+## v2.4.3
+
+- Fixed radar animation and refresh updates on ephemeral panels returning Discord error 10008 (`Unknown Message`).
+- Radar panels now update through the interaction webhook, preserving all existing controls and attachments.
+
 ## v2.4.2
 
 - Moved the precipitation forecast interpretation to the bottom of current-weather embeds.

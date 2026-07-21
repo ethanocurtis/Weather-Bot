@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.4.2"
+BOT_VERSION = "2.4.3"
 
 
 
@@ -1533,8 +1533,16 @@ class Weather(commands.Cog):
             embed.set_footer(text=footer)
             view = RadarView(self, interaction.user.id, loc, range_miles)
 
-            if edit_message and interaction.message:
-                await interaction.message.edit(embed=embed, attachments=[file], view=view)
+            if edit_message:
+                # Ephemeral radar panels cannot reliably be edited through
+                # interaction.message.edit(); Discord may return 10008 Unknown Message.
+                # Editing the interaction's original response uses the webhook
+                # endpoint and works for both ephemeral and normal component messages.
+                await interaction.edit_original_response(
+                    embed=embed,
+                    attachments=[file],
+                    view=view,
+                )
             else:
                 await interaction.followup.send(embed=embed, file=file, view=view, ephemeral=ephemeral)
             self.store.record_event("radar_animation" if animated else "radar_lookup", interaction.user.id, interaction.guild.id if interaction.guild else None)
