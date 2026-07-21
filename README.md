@@ -258,4 +258,30 @@ The dashboard builds on the existing subscription and weather-role setup wizards
 
 Use `/radar` for a current NOAA/NWS MRMS base-reflectivity image around a US location. The command uses your saved default location when no location is provided and supports 25, 50, 100, and 250-mile ranges. Radar is also available from `/dashboard` and documented in `/help`.
 
-The first radar release is static and US-focused. The provider layer is isolated so animation and worldwide providers can be added later.
+Radar panels now include an **Animate** button that generates an eight-frame loop from recent NOAA/NWS MRMS imagery. Static radar remains the fast default, while animation can be generated on demand. Radar is currently US-focused; the provider layer remains isolated for future worldwide providers.
+
+
+## v2.4.0
+
+### Animated radar
+
+- Added an **Animate** button to radar panels.
+- Generates an eight-frame looping GIF showing recent storm movement.
+- Reuses the selected location and range without another geocoding request.
+- Keeps Refresh, Change Location, Forecast, Briefing, and Remove controls.
+- Records animated radar usage separately in owner analytics.
+
+### Richer current weather
+
+The `/weather` result and radar panel's Forecast button now include:
+
+- Current and feels-like temperatures
+- Daily high and low
+- Precipitation chance and expected amount
+- Wind direction, speed, and gusts
+- Humidity and dew point
+- UV index with risk category
+- Visibility and atmospheric pressure
+- Local sunrise and sunset
+
+Both standard and metric unit preferences are supported.

@@ -28,7 +28,7 @@ HTTP_HEADERS = {
 # ---- Feedback routing (set via env) ----
 BOT_OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)  # your Discord user id
 FEEDBACK_CHANNEL_ID = int(os.getenv("FEEDBACK_CHANNEL_ID", "0") or 0)  # optional: send feedback to this channel id
-BOT_VERSION = "2.3.3"
+BOT_VERSION = "2.4.0"
 
 
 
@@ -711,6 +711,9 @@ class WeatherRoleToggleButton(discord.ui.Button):
 RADAR_SERVICE_URL = "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/radar_base_reflectivity_time/ImageServer/exportImage"
 RADAR_BASEMAP_URL = "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/export"
 RADAR_ALLOWED_RANGES = (25, 50, 100, 250)
+RADAR_ANIMATION_FRAMES = 8
+RADAR_ANIMATION_STEP_MINUTES = 10
+RADAR_ANIMATION_DURATION_MS = 550
 
 
 class RadarLocationModal(discord.ui.Modal, title="Change Radar Location"):
@@ -755,6 +758,18 @@ class RadarView(discord.ui.View):
             ephemeral=True,
             resolved_location=self.location,
             edit_message=True,
+        )
+
+    @discord.ui.button(label="Animate", emoji="▶️", style=discord.ButtonStyle.success, row=0)
+    async def animate(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self.cog.send_radar(
+            interaction,
+            None,
+            self.range_miles,
+            ephemeral=True,
+            resolved_location=self.location,
+            edit_message=True,
+            animated=True,
         )
 
     @discord.ui.button(label="Change Location", emoji="📍", style=discord.ButtonStyle.secondary, row=0)
@@ -1153,22 +1168,166 @@ class Weather(commands.Cog):
         await inter.response.send_message(f"**Location:** {loc['display_name'] if loc else 'Not set'}\n**Units:** {_get_user_units(self.store,inter.user.id)}\n**Timezone:** {_get_user_tz_name(self.store,inter.user.id)}",ephemeral=True)
 
     async def _current_embed(self, session, loc, units, tz_name):
-        temp_unit="fahrenheit" if units=="standard" else "celsius"; wind_unit="mph" if units=="standard" else "kmh"; precip_unit="inch" if units=="standard" else "mm"; deg="°F" if units=="standard" else "°C"
-        params={"latitude":loc["latitude"],"longitude":loc["longitude"],"temperature_unit":temp_unit,"wind_speed_unit":wind_unit,"precipitation_unit":precip_unit,"timezone":tz_name,"current":"temperature_2m,apparent_temperature,relative_humidity_2m,wind_speed_10m,wind_gusts_10m,precipitation,weather_code","daily":"weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max"}
-        async with session.get("https://api.open-meteo.com/v1/forecast",params=params,timeout=aiohttp.ClientTimeout(total=15)) as r:
-            if r.status!=200: raise RuntimeError("Weather service unavailable")
-            wx=await r.json()
-        cur=wx.get("current") or {}; daily=wx.get("daily") or {}; code=(daily.get("weather_code") or [cur.get("weather_code",0)])[0]; icon,desc=wx_icon_desc(code)
-        t=cur.get("temperature_2m"); hi=(daily.get("temperature_2m_max") or [None])[0]; lo=(daily.get("temperature_2m_min") or [None])[0]
-        emb=discord.Embed(title=f"{icon} Weather — {loc['display_name']}",description=f"**{desc}**",colour=wx_color_from_temp_f(float(t) if t is not None and units=="standard" else 70))
-        if t is not None: emb.add_field(name="Now",value=f"**{round(t)}{deg}** (feels {round(cur.get('apparent_temperature',t))}{deg})")
-        if hi is not None: emb.add_field(name="Today",value=f"High **{round(hi)}{deg}** / Low **{round(lo)}{deg}**")
-        emb.add_field(name="Wind",value=f"{round(cur.get('wind_speed_10m',0))} {wind_unit} (gusts {round(cur.get('wind_gusts_10m',0))} {wind_unit})")
-        emb.add_field(name="Humidity",value=f"{cur.get('relative_humidity_2m','?')}%")
-        emb.add_field(name="Precip Chance",value=f"{(daily.get('precipitation_probability_max') or ['?'])[0]}%")
-        emb.add_field(name="UV",value=str((daily.get('uv_index_max') or ['?'])[0]))
-        emb.set_footer(text=f"Units: {units} • Timezone: {tz_name}")
-        return emb
+        temp_unit = "fahrenheit" if units == "standard" else "celsius"
+        wind_unit = "mph" if units == "standard" else "kmh"
+        precip_unit = "inch" if units == "standard" else "mm"
+        deg = "°F" if units == "standard" else "°C"
+        distance_unit = "mi" if units == "standard" else "km"
+        pressure_unit = "inHg" if units == "standard" else "hPa"
+
+        params = {
+            "latitude": loc["latitude"],
+            "longitude": loc["longitude"],
+            "temperature_unit": temp_unit,
+            "wind_speed_unit": wind_unit,
+            "precipitation_unit": precip_unit,
+            "timezone": tz_name,
+            "current": (
+                "temperature_2m,apparent_temperature,relative_humidity_2m,dew_point_2m,"
+                "pressure_msl,visibility,wind_speed_10m,wind_direction_10m,wind_gusts_10m,"
+                "precipitation,weather_code"
+            ),
+            "daily": (
+                "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,"
+                "precipitation_probability_max,uv_index_max,sunrise,sunset,wind_speed_10m_max"
+            ),
+        }
+        async with session.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                raise RuntimeError("Weather service unavailable")
+            wx = await response.json()
+
+        cur = wx.get("current") or {}
+        daily = wx.get("daily") or {}
+        code = (daily.get("weather_code") or [cur.get("weather_code", 0)])[0]
+        icon, desc = wx_icon_desc(code)
+        temperature = cur.get("temperature_2m")
+        apparent = cur.get("apparent_temperature", temperature)
+        high = (daily.get("temperature_2m_max") or [None])[0]
+        low = (daily.get("temperature_2m_min") or [None])[0]
+
+        def first(key, default=None):
+            values = daily.get(key) or []
+            return values[0] if values else default
+
+        def cardinal(degrees):
+            if degrees is None:
+                return "?"
+            points = ("N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW")
+            return points[int((float(degrees) + 11.25) // 22.5) % 16]
+
+        def uv_label(value):
+            try:
+                uv = float(value)
+            except (TypeError, ValueError):
+                return "Unknown"
+            if uv < 3: return "Low"
+            if uv < 6: return "Moderate"
+            if uv < 8: return "High"
+            if uv < 11: return "Very High"
+            return "Extreme"
+
+        visibility_m = cur.get("visibility")
+        visibility = None
+        if visibility_m is not None:
+            visibility = float(visibility_m) / (1609.344 if units == "standard" else 1000.0)
+
+        pressure_hpa = cur.get("pressure_msl")
+        pressure = None
+        if pressure_hpa is not None:
+            pressure = float(pressure_hpa) * 0.0295299830714 if units == "standard" else float(pressure_hpa)
+
+        colour_temp_f = None
+        if temperature is not None:
+            colour_temp_f = float(temperature) if units == "standard" else (float(temperature) * 9 / 5 + 32)
+
+        embed = discord.Embed(
+            title=f"{icon} Weather — {loc['display_name']}",
+            description=f"**{desc}**",
+            colour=wx_color_from_temp_f(colour_temp_f if colour_temp_f is not None else 70),
+            timestamp=datetime.now(timezone.utc),
+        )
+        if temperature is not None:
+            embed.add_field(
+                name="🌡️ Current",
+                value=f"**{round(temperature)}{deg}**\nFeels like **{round(apparent)}{deg}**",
+                inline=True,
+            )
+        if high is not None and low is not None:
+            embed.add_field(
+                name="📅 Today",
+                value=f"High **{round(high)}{deg}**\nLow **{round(low)}{deg}**",
+                inline=True,
+            )
+
+        rain_chance = first("precipitation_probability_max", "?")
+        rain_total = first("precipitation_sum", "?")
+        embed.add_field(
+            name="🌧️ Precipitation",
+            value=f"Chance **{rain_chance}%**\nExpected **{rain_total} {precip_unit}**",
+            inline=True,
+        )
+
+        wind_speed = cur.get("wind_speed_10m", 0)
+        wind_gust = cur.get("wind_gusts_10m", 0)
+        wind_dir = cardinal(cur.get("wind_direction_10m"))
+        embed.add_field(
+            name="🌬️ Wind",
+            value=f"**{round(wind_speed)} {wind_unit} {wind_dir}**\nGusts **{round(wind_gust)} {wind_unit}**",
+            inline=True,
+        )
+
+        humidity = cur.get("relative_humidity_2m", "?")
+        dew_point = cur.get("dew_point_2m")
+        dew_text = f"{round(dew_point)}{deg}" if dew_point is not None else "?"
+        embed.add_field(
+            name="💧 Humidity",
+            value=f"Humidity **{humidity}%**\nDew point **{dew_text}**",
+            inline=True,
+        )
+
+        uv = first("uv_index_max", "?")
+        embed.add_field(
+            name="☀️ UV Index",
+            value=f"**{uv}** · {uv_label(uv)}",
+            inline=True,
+        )
+
+        if visibility is not None:
+            visibility_text = f"{visibility:.1f} {distance_unit}"
+        else:
+            visibility_text = "?"
+        if pressure is not None:
+            pressure_text = f"{pressure:.2f} {pressure_unit}" if units == "standard" else f"{pressure:.0f} {pressure_unit}"
+        else:
+            pressure_text = "?"
+        embed.add_field(
+            name="👁️ Atmosphere",
+            value=f"Visibility **{visibility_text}**\nPressure **{pressure_text}**",
+            inline=True,
+        )
+
+        sunrise = first("sunrise")
+        sunset = first("sunset")
+        def clock(value):
+            if not value:
+                return "?"
+            try:
+                return datetime.fromisoformat(value).strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                return str(value)
+        embed.add_field(
+            name="🌅 Sun",
+            value=f"Sunrise **{clock(sunrise)}**\nSunset **{clock(sunset)}**",
+            inline=True,
+        )
+
+        embed.set_footer(text=f"Open-Meteo • Units: {units} • Timezone: {tz_name}")
+        return embed
 
 
     @staticmethod
@@ -1188,23 +1347,8 @@ class Weather(commands.Cog):
                 raise RuntimeError("Radar imagery is temporarily unavailable.")
             return data
 
-    async def _fetch_radar_image(self, session: aiohttp.ClientSession, loc: Dict[str, Any], range_miles: int) -> bytes:
-        bbox = self._radar_bbox(float(loc["latitude"]), float(loc["longitude"]), range_miles)
-        common = {
-            "bbox": bbox,
-            "bboxSR": "4326",
-            "imageSR": "4326",
-            "size": "900,700",
-            "f": "image",
-        }
-        basemap_params = {**common, "format": "png32", "transparent": "false"}
-        radar_params = {**common, "format": "png32", "transparent": "true"}
-
-        basemap_bytes, radar_bytes = await asyncio.gather(
-            self._fetch_map_image(session, RADAR_BASEMAP_URL, basemap_params),
-            self._fetch_map_image(session, RADAR_SERVICE_URL, radar_params),
-        )
-
+    @staticmethod
+    def _compose_radar_frame(basemap_bytes: bytes, radar_bytes: bytes) -> Image.Image:
         try:
             basemap = Image.open(io.BytesIO(basemap_bytes)).convert("RGBA")
             radar = Image.open(io.BytesIO(radar_bytes)).convert("RGBA")
@@ -1215,11 +1359,77 @@ class Weather(commands.Cog):
             cx, cy = composite.width // 2, composite.height // 2
             draw.ellipse((cx - 8, cy - 8, cx + 8, cy + 8), fill=(255, 255, 255, 245), outline=(20, 20, 20, 255), width=2)
             draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=(220, 35, 35, 255))
-            output = io.BytesIO()
-            composite.convert("RGB").save(output, format="PNG", optimize=True)
-            return output.getvalue()
+            return composite.convert("RGB")
         except Exception as exc:
             raise RuntimeError("Radar image could not be rendered.") from exc
+
+    async def _radar_common_images(self, session: aiohttp.ClientSession, loc: Dict[str, Any], range_miles: int):
+        bbox = self._radar_bbox(float(loc["latitude"]), float(loc["longitude"]), range_miles)
+        common = {
+            "bbox": bbox,
+            "bboxSR": "4326",
+            "imageSR": "4326",
+            "size": "720,560",
+            "f": "image",
+        }
+        basemap_params = {**common, "format": "png32", "transparent": "false"}
+        basemap_bytes = await self._fetch_map_image(session, RADAR_BASEMAP_URL, basemap_params)
+        return common, basemap_bytes
+
+    async def _fetch_radar_image(self, session: aiohttp.ClientSession, loc: Dict[str, Any], range_miles: int) -> bytes:
+        common, basemap_bytes = await self._radar_common_images(session, loc, range_miles)
+        radar_params = {**common, "format": "png32", "transparent": "true"}
+        radar_bytes = await self._fetch_map_image(session, RADAR_SERVICE_URL, radar_params)
+        composite = self._compose_radar_frame(basemap_bytes, radar_bytes)
+        output = io.BytesIO()
+        composite.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+    async def _fetch_radar_animation(self, session: aiohttp.ClientSession, loc: Dict[str, Any], range_miles: int) -> bytes:
+        common, basemap_bytes = await self._radar_common_images(session, loc, range_miles)
+
+        # NOAA's time-enabled MRMS service accepts epoch milliseconds. Using a
+        # short recent window keeps generation fast and the GIF below Discord's
+        # normal upload limits while still clearly showing storm movement.
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        timestamps = [
+            now - timedelta(minutes=RADAR_ANIMATION_STEP_MINUTES * offset)
+            for offset in reversed(range(RADAR_ANIMATION_FRAMES))
+        ]
+        radar_requests = [
+            self._fetch_map_image(
+                session,
+                RADAR_SERVICE_URL,
+                {
+                    **common,
+                    "format": "png32",
+                    "transparent": "true",
+                    "time": str(int(moment.timestamp() * 1000)),
+                },
+            )
+            for moment in timestamps
+        ]
+        radar_images = await asyncio.gather(*radar_requests)
+        frames = [self._compose_radar_frame(basemap_bytes, radar) for radar in radar_images]
+
+        # Adaptive palettes drastically reduce GIF size without making radar
+        # colors unreadable. The last frame pauses slightly longer.
+        palette_frames = [frame.convert("P", palette=Image.Palette.ADAPTIVE, colors=192) for frame in frames]
+        output = io.BytesIO()
+        palette_frames[0].save(
+            output,
+            format="GIF",
+            save_all=True,
+            append_images=palette_frames[1:],
+            duration=[RADAR_ANIMATION_DURATION_MS] * (len(palette_frames) - 1) + [1100],
+            loop=0,
+            optimize=True,
+            disposal=2,
+        )
+        data = output.getvalue()
+        if len(data) > 9_500_000:
+            raise RuntimeError("The animated radar exceeded Discord's upload limit. Try a smaller radar range.")
+        return data
 
     async def send_radar(
         self,
@@ -1230,6 +1440,7 @@ class Weather(commands.Cog):
         ephemeral: bool = False,
         resolved_location: Optional[Dict[str, Any]] = None,
         edit_message: bool = False,
+        animated: bool = False,
     ):
         range_miles = min(RADAR_ALLOWED_RANGES, key=lambda value: abs(value - int(range_miles)))
         if not interaction.response.is_done():
@@ -1240,29 +1451,34 @@ class Weather(commands.Cog):
                 country = (loc.get("country_code") or "").upper()
                 if country not in {"US", "USA"}:
                     raise RuntimeError("Radar currently supports US locations. Worldwide radar can be added through another provider later.")
-                image = await self._fetch_radar_image(session, loc, range_miles)
+                image = await (
+                    self._fetch_radar_animation(session, loc, range_miles)
+                    if animated
+                    else self._fetch_radar_image(session, loc, range_miles)
+                )
 
-            file = discord.File(io.BytesIO(image), filename="radar.png")
+            filename = "radar.gif" if animated else "radar.png"
+            file = discord.File(io.BytesIO(image), filename=filename)
+            mode_text = "Animated recent radar" if animated else "Latest radar image"
             embed = discord.Embed(
                 title=f"🛰️ Radar — {loc['display_name']}",
-                description=f"Latest NOAA/NWS base reflectivity · **{range_miles}-mile range**",
+                description=f"{mode_text} · **{range_miles}-mile range**",
                 colour=discord.Colour.blurple(),
                 timestamp=datetime.now(timezone.utc),
             )
-            embed.set_image(url="attachment://radar.png")
-            embed.set_footer(text="NOAA/NWS MRMS radar over street map • Refreshes approximately every 5 minutes")
+            embed.set_image(url=f"attachment://{filename}")
+            footer = "NOAA/NWS MRMS radar over street map"
+            footer += " • 8 recent frames" if animated else " • Refreshes approximately every 5 minutes"
+            embed.set_footer(text=footer)
             view = RadarView(self, interaction.user.id, loc, range_miles)
 
             if edit_message and interaction.message:
                 await interaction.message.edit(embed=embed, attachments=[file], view=view)
             else:
                 await interaction.followup.send(embed=embed, file=file, view=view, ephemeral=ephemeral)
-            self.store.record_event("radar_lookup", interaction.user.id, interaction.guild.id if interaction.guild else None)
+            self.store.record_event("radar_animation" if animated else "radar_lookup", interaction.user.id, interaction.guild.id if interaction.guild else None)
         except Exception as exc:
-            if edit_message and interaction.message:
-                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
-            else:
-                await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
+            await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
 
     @app_commands.command(name="radar", description="Show NOAA weather radar for a US location.")
     @app_commands.describe(location="US city, place, ZIP code, or saved location", range_miles="Radar radius around the location")
