@@ -1581,7 +1581,7 @@ class Weather(commands.Cog):
                 loc=await self._resolve_location(session,inter.user.id,location)
                 tz=loc.get("timezone") or _get_user_tz_name(self.store,inter.user.id)
                 emb=await self._current_embed(session,loc,_get_user_units(self.store,inter.user.id),tz)
-            await inter.followup.send(embed=emb, ephemeral=ephemeral)
+            await inter.followup.send(embed=emb)
             self.store.record_event("weather_lookup", inter.user.id, inter.guild.id if inter.guild else None)
         except Exception as e: await inter.followup.send(f"⚠️ {e}",ephemeral=True)
 
